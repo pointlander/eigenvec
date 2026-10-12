@@ -45,7 +45,7 @@ func TestGenerateStaysOnObservedEdges(t *testing.T) {
 	g.rankPages(damp, 1e-14)
 	g.normalizeSuccessors()
 
-	prompt := []rune("To be")
+	prompt := []rune("To be or")
 	out := g.generate(prompt, 80, 1)
 	if !strings.HasPrefix(string(out), string(prompt)) {
 		t.Fatalf("output %q does not start with the prompt", string(out))
@@ -87,17 +87,34 @@ func TestPrepareStripsHeaderAndSpeechBreaks(t *testing.T) {
 	}
 }
 
+func TestPrepareStripsIndentAndLineNumbers(t *testing.T) {
+	raw := "" +
+		"  Thy unused beauty must be tombed with thee,\n" +
+		"And set dissension ’twixt the son and sire;         1160\n" +
+		"                    5\n" +
+		"HAMLET.\n" +
+		"   ’One fair daughter, and no more,\n"
+	got := prepare(raw)
+	want := "" +
+		"Thy unused beauty must be tombed with thee,\n" +
+		"And set dissension ’twixt the son and sire;\n" +
+		"HAMLET. ’One fair daughter, and no more,"
+	if got != want {
+		t.Fatalf("prepare() = %q, want %q", got, want)
+	}
+}
+
 func TestPromptSumsNextCharacterMass(t *testing.T) {
-	// "abXY" is followed by 'q' twice and 'z' once. Both "abXY" and "cdXY"
-	// end in the order-2 context "XY", so they share a conditional
-	// distribution. "bXYq" ends in "Yq" and must not mix into it.
-	src := []rune("abXYqabXYzabXYqcdXYr")
+	// "abcdXY" is followed by 'q' twice and 'z' once. Both "abcdXY" and
+	// "wxyzXY" end in the order-2 context "XY", so they share a conditional
+	// distribution. "bcdXYq" ends in "Yq" and must not mix into it.
+	src := []rune("abcdXYqabcdXYzabcdXYqwxyzXYr")
 	g := buildGraph(src)
 	g.rankPages(damp, 1e-15)
 	g.normalizeSuccessors()
 
 	model := map[context]map[rune]float64{}
-	node := g.id[tokenFrom([]rune("abXY"))]
+	node := g.id[tokenFrom([]rune("abcdXY"))]
 	g.addNext(model, node)
 	ctx := contextOf(g.token[node])
 	dist := model[ctx]
@@ -121,11 +138,11 @@ func TestPromptSumsNextCharacterMass(t *testing.T) {
 		t.Fatalf("dist = %v, want q=%v z=%v", dist, firstQ, firstZ)
 	}
 
-	// A different order-4 node with the same two-character suffix is mixed
-	// in at weight mix, then normalized.
-	other := g.id[tokenFrom([]rune("cdXY"))]
+	// A different node with the same two-character suffix is mixed in at
+	// weight mix, then normalized.
+	other := g.id[tokenFrom([]rune("wxyzXY"))]
 	if contextOf(g.token[other]) != ctx {
-		t.Fatal("cdXY should share the order-2 context of abXY")
+		t.Fatal("wxyzXY should share the order-2 context of abcdXY")
 	}
 	before := make(map[rune]float64, len(dist))
 	for ch, p := range dist {
@@ -159,7 +176,7 @@ func TestPromptSumsNextCharacterMass(t *testing.T) {
 	for ch, p := range dist {
 		kept[ch] = p
 	}
-	separate := g.id[tokenFrom([]rune("bXYq"))]
+	separate := g.id[tokenFrom([]rune("bcdXYq"))]
 	g.addNext(model, separate)
 	dist = model[ctx]
 	for ch, p := range kept {
@@ -169,7 +186,7 @@ func TestPromptSumsNextCharacterMass(t *testing.T) {
 	}
 	otherCtx := contextOf(g.token[separate])
 	if otherCtx == ctx {
-		t.Fatal("bXYq should not share the order-2 context of abXY")
+		t.Fatal("bcdXYq should not share the order-2 context of abcdXY")
 	}
 	if math.Abs(sumDist(model[otherCtx])-1) > 1e-12 {
 		t.Fatalf("separate conditional sums to %v", sumDist(model[otherCtx]))
@@ -185,7 +202,7 @@ func TestEdgeWeightFollowsFourGram(t *testing.T) {
 	wa := edgeWeight(outs[0], dist, 1)
 	wb := edgeWeight(outs[1], dist, 1)
 	if wa <= wb {
-		t.Fatalf("4-gram favorite a=%v should stay ahead of tilted b=%v", wa, wb)
+		t.Fatalf("token favorite a=%v should stay ahead of tilted b=%v", wa, wb)
 	}
 	if math.Abs(wa-(1-tilt)*0.8) > 1e-12 {
 		t.Fatalf("a weight = %v", wa)
@@ -194,11 +211,37 @@ func TestEdgeWeightFollowsFourGram(t *testing.T) {
 	if math.Abs(wb-wantB) > 1e-12 {
 		t.Fatalf("b weight = %v, want %v", wb, wantB)
 	}
-	// With no conditional mass the weights stay proportional to the 4-gram.
+	// With no conditional mass the weights stay proportional to the token.
 	wa = edgeWeight(outs[0], nil, 0)
 	wb = edgeWeight(outs[1], nil, 0)
 	if math.Abs(wa/wb-4) > 1e-9 {
 		t.Fatalf("untilted ratio = %v, want 4", wa/wb)
+	}
+}
+
+func TestEdgeProbabilityUsesCountAndRank(t *testing.T) {
+	src := []rune("abcdXYqabcdXYzabcdXYq")
+	g := buildGraph(src)
+	g.rankPages(damp, 1e-15)
+	g.normalizeSuccessors()
+	node := g.id[tokenFrom([]rune("abcdXY"))]
+	var pq, pz, wq, wz, rq, rz float64
+	for _, e := range g.outs[node] {
+		switch e.ch {
+		case 'q':
+			pq, wq, rq = e.p, e.w, g.rank[e.to]
+		case 'z':
+			pz, wz, rz = e.p, e.w, g.rank[e.to]
+		}
+	}
+	if pq <= 0 || pz <= 0 {
+		t.Fatalf("p(q)=%v p(z)=%v", pq, pz)
+	}
+	if math.Abs(pq+pz-1) > 1e-12 {
+		t.Fatalf("edge probabilities sum to %v", pq+pz)
+	}
+	if math.Abs(pq/pz-(wq*rq)/(wz*rz)) > 1e-9 {
+		t.Fatalf("p ratio %v, want count*rank ratio %v", pq/pz, (wq*rq)/(wz*rz))
 	}
 }
 

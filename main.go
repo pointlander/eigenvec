@@ -2,16 +2,17 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Command eigenvec builds an order-4 Markov graph of the characters in a
+// Command eigenvec builds an order-6 Markov graph of the characters in a
 // text, computes its PageRank (the principal eigenvector of the damped
 // transition matrix), and generates text from that ranking.
 //
-// A prompt is walked as a path of overlapping 4-character nodes. At every
-// node the PageRank scores of the successors are normalized into a
+// A prompt is walked as a path of overlapping 6-character nodes. At every
+// node the count-weighted PageRank of the successors is normalized into a
 // distribution over the next character and mixed, with a small weight,
 // into an order-2 model P(next | the last two characters). Generation
-// follows the current 4-gram. The order-2 conditional only tilts that
-// choice. Each step then mixes the new node in the same way.
+// follows that distribution, softened by a temperature slightly above 1.
+// The order-2 conditional only tilts the choice. Each step then mixes the
+// new node in the same way.
 package main
 
 import (
@@ -36,21 +37,23 @@ const (
 	// maxRankIter caps power iteration.
 	maxRankIter = 10000
 	// order is the number of characters in a Markov token.
-	order = 4
+	order = 6
 	// sumOrder is the order of the summed next-character model.
 	sumOrder = 2
 	// mix is the weight of a new visit in an order-2 conditional.
 	// The previous conditional keeps the rest.
 	mix = 0.15
 	// tilt is the share of a draw taken from the order-2 conditional.
-	// The rest follows the current 4-gram.
+	// The rest follows the current token.
 	tilt = 0.15
+	// temp softens the token distribution. 1 leaves it unchanged.
+	temp = 1.5
 )
 
 // context is the order-2 state the summed distribution conditions on.
 type context [sumOrder]rune
 
-// token is an order-4 Markov state: four successive characters.
+// token is an order-6 Markov state: six successive characters.
 type token [order]rune
 
 // edge is a weighted transition to the shifted token.
@@ -58,11 +61,11 @@ type edge struct {
 	to int
 	w  float64
 	ch rune
-	// p is the successor's PageRank normalized over this node's successors.
+	// p is the count-weighted successor PageRank, normalized over this node's successors.
 	p float64
 }
 
-// Graph is the order-4 character graph and its PageRank vector.
+// Graph is the order-6 character graph and its PageRank vector.
 type Graph struct {
 	outs  [][]edge
 	token []token
@@ -84,7 +87,7 @@ func main() {
 	}
 	runes := []rune(prepare(string(text)))
 	if len(runes) < order+1 {
-		log.Fatal("text is shorter than an order-4 transition")
+		log.Fatalf("text is shorter than an order-%d transition", order)
 	}
 
 	g := buildGraph(runes)
@@ -100,7 +103,8 @@ func main() {
 
 // prepare drops the Project Gutenberg header and license, joins a period
 // to the next line, and removes blank lines. ".\\n" and "\\n\\n" are the
-// breaks between speeches.
+// breaks between speeches. Leading spaces and the right-margin verse
+// numbers are removed.
 func prepare(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "\n")
@@ -117,6 +121,7 @@ func prepare(s string) string {
 	if i := strings.Index(s, endMark); i >= 0 {
 		s = s[:i]
 	}
+	s = cleanLines(s)
 
 	var b strings.Builder
 	b.Grow(len(s))
@@ -141,9 +146,66 @@ func prepare(s string) string {
 	return strings.TrimSpace(b.String())
 }
 
-// buildGraph counts order-4 transitions. Node abcd links to bcde once for
-// every time e follows the characters abcd. Windows overlap by three
-// characters.
+// cleanLines trims leading spaces, drops a verse number that sits at the
+// end of a line after at least two spaces, and drops lines that are only a
+// number.
+func cleanLines(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	start := 0
+	for i := 0; i <= len(s); i++ {
+		if i != len(s) && s[i] != '\n' {
+			continue
+		}
+		line := strings.TrimLeft(s[start:i], " \t")
+		start = i + 1
+		if isDigits(line) {
+			continue
+		}
+		line = stripMarginNumber(line)
+		b.WriteString(line)
+		if i != len(s) {
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+// stripMarginNumber removes a trailing run of digits when at least two
+// spaces separate it from the rest of the line.
+func stripMarginNumber(line string) string {
+	i := len(line)
+	for i > 0 && line[i-1] >= '0' && line[i-1] <= '9' {
+		i--
+	}
+	if i == len(line) {
+		return line
+	}
+	j := i
+	for j > 0 && line[j-1] == ' ' {
+		j--
+	}
+	if i-j < 2 {
+		return line
+	}
+	return line[:j]
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// buildGraph counts order-6 transitions. A node links to the token shifted
+// one character ahead once for every time that character follows it.
+// Windows overlap by five characters.
 func buildGraph(runes []rune) *Graph {
 	seen := make(map[token]struct{})
 	counts := make(map[token]map[rune]int)
@@ -207,7 +269,7 @@ func tokenFrom(rs []rune) token {
 	return t
 }
 
-// shifted is the next order-4 token after appending ch.
+// shifted is the next token after appending ch.
 func shifted(t token, ch rune) token {
 	var n token
 	copy(n[:order-1], t[1:])
@@ -280,20 +342,21 @@ func (g *Graph) rankPages(damp, tol float64) int {
 	return iters
 }
 
-// normalizeSuccessors stores, on each edge, the successor PageRank divided
-// by the sum of successor PageRanks. That is the local next-character distribution.
+// normalizeSuccessors stores, on each edge, the count-weighted successor
+// PageRank divided by the sum of those weights. That is the local
+// next-character distribution.
 func (g *Graph) normalizeSuccessors() {
 	for i, outs := range g.outs {
 		sum := 0.0
 		for _, e := range outs {
-			sum += g.rank[e.to]
+			sum += e.w * g.rank[e.to]
 		}
 		if sum == 0 {
 			continue
 		}
 		inv := 1 / sum
 		for j := range outs {
-			g.outs[i][j].p = g.rank[outs[j].to] * inv
+			g.outs[i][j].p = outs[j].w * g.rank[outs[j].to] * inv
 		}
 	}
 }
@@ -342,8 +405,8 @@ func normalizeDist(dist map[rune]float64) {
 }
 
 // generate walks the prompt, mixing each token into the order-2 model.
-// Each sample follows the current 4-gram, tilted by that model, then
-// steps to the successor and mixes the new node in.
+// Each sample follows the current token, softened by temp and tilted by
+// that model, then steps to the successor and mixes the new node in.
 func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 	if len(prompt) < order {
 		log.Fatalf("prompt must contain at least %d characters", order)
@@ -359,7 +422,7 @@ func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 		cur = node
 	}
 	if cur < 0 {
-		log.Fatal("prompt shares no order-4 token with the text")
+		log.Fatalf("prompt shares no order-%d token with the text", order)
 	}
 
 	rng := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
@@ -377,10 +440,10 @@ func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 	return out
 }
 
-// edgeWeight is the current 4-gram's edge probability, tilted by the
+// edgeWeight is the current token's edge probability, tilted by the
 // order-2 conditional. The conditional is renormalized over the legal
-// successors. A character the conditional has not seen keeps its 4-gram
-// share.
+// successors. A character the conditional has not seen keeps its share of
+// the token distribution.
 func edgeWeight(e edge, dist map[rune]float64, priorSum float64) float64 {
 	w := (1 - tilt) * e.p
 	if priorSum > 0 {
@@ -389,8 +452,8 @@ func edgeWeight(e edge, dist map[rune]float64, priorSum float64) float64 {
 	return w
 }
 
-// sample draws a successor of the current 4-gram. The order-2 conditional
-// only tilts the 4-gram probabilities.
+// sample draws a successor of the current token. The token distribution is
+// softened by temp, then the order-2 conditional tilts it.
 func sample(dist map[rune]float64, outs []edge, rng *rand.Rand) edge {
 	priorSum := 0.0
 	for _, e := range outs {
@@ -398,9 +461,13 @@ func sample(dist map[rune]float64, outs []edge, rng *rand.Rand) edge {
 			priorSum += p
 		}
 	}
+	grams := temper(outs)
 	total := 0.0
-	for _, e := range outs {
-		total += edgeWeight(e, dist, priorSum)
+	weights := make([]float64, len(outs))
+	for i, e := range outs {
+		e.p = grams[i]
+		weights[i] = edgeWeight(e, dist, priorSum)
+		total += weights[i]
 	}
 	if total == 0 {
 		return outs[rng.IntN(len(outs))]
@@ -409,14 +476,13 @@ func sample(dist map[rune]float64, outs []edge, rng *rand.Rand) edge {
 	acc := 0.0
 	var last edge
 	seen := false
-	for _, e := range outs {
-		w := edgeWeight(e, dist, priorSum)
-		if w <= 0 {
+	for i, e := range outs {
+		if weights[i] <= 0 {
 			continue
 		}
 		last = e
 		seen = true
-		acc += w
+		acc += weights[i]
 		if r <= acc {
 			return e
 		}
@@ -427,7 +493,34 @@ func sample(dist map[rune]float64, outs []edge, rng *rand.Rand) edge {
 	return outs[len(outs)-1]
 }
 
-// printTop writes the highest-ranking order-4 tokens.
+// temper raises each edge probability to 1/temp and renormalizes, which
+// flattens the token distribution when temp is above 1.
+func temper(outs []edge) []float64 {
+	grams := make([]float64, len(outs))
+	if temp == 1 {
+		for i, e := range outs {
+			grams[i] = e.p
+		}
+		return grams
+	}
+	inv := 1 / temp
+	sum := 0.0
+	for i, e := range outs {
+		if e.p > 0 {
+			grams[i] = math.Pow(e.p, inv)
+			sum += grams[i]
+		}
+	}
+	if sum == 0 {
+		return grams
+	}
+	for i := range grams {
+		grams[i] /= sum
+	}
+	return grams
+}
+
+// printTop writes the highest-ranking tokens.
 func (g *Graph) printTop(w *os.File, k int) {
 	if k <= 0 || len(g.rank) == 0 {
 		return
