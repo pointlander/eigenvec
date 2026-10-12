@@ -121,8 +121,8 @@ func TestPromptSumsNextCharacterMass(t *testing.T) {
 		t.Fatalf("dist = %v, want q=%v z=%v", dist, firstQ, firstZ)
 	}
 
-	// A different order-4 node with the same two-character suffix is
-	// averaged into this conditional, then normalized.
+	// A different order-4 node with the same two-character suffix is mixed
+	// in at weight mix, then normalized.
 	other := g.id[tokenFrom([]rune("cdXY"))]
 	if contextOf(g.token[other]) != ctx {
 		t.Fatal("cdXY should share the order-2 context of abXY")
@@ -141,13 +141,13 @@ func TestPromptSumsNextCharacterMass(t *testing.T) {
 		added[e.ch] += e.p
 	}
 	for ch, p := range before {
-		want := (p + added[ch]) / 2
+		want := (1-mix)*p + mix*added[ch]
 		if math.Abs(dist[ch]-want) > 1e-12 {
 			t.Fatalf("dist[%q] = %v, want %v", ch, dist[ch], want)
 		}
 	}
 	for ch, p := range added {
-		want := (before[ch] + p) / 2
+		want := (1-mix)*before[ch] + mix*p
 		if math.Abs(dist[ch]-want) > 1e-12 {
 			t.Fatalf("dist[%q] = %v, want %v", ch, dist[ch], want)
 		}
@@ -176,6 +176,29 @@ func TestPromptSumsNextCharacterMass(t *testing.T) {
 	}
 	if model[otherCtx]['a'] <= 0 {
 		t.Fatalf("separate conditional = %v, want mass on 'a'", model[otherCtx])
+	}
+}
+
+func TestEdgeWeightFollowsFourGram(t *testing.T) {
+	outs := []edge{{ch: 'a', p: 0.8}, {ch: 'b', p: 0.2}}
+	dist := map[rune]float64{'b': 1}
+	wa := edgeWeight(outs[0], dist, 1)
+	wb := edgeWeight(outs[1], dist, 1)
+	if wa <= wb {
+		t.Fatalf("4-gram favorite a=%v should stay ahead of tilted b=%v", wa, wb)
+	}
+	if math.Abs(wa-(1-tilt)*0.8) > 1e-12 {
+		t.Fatalf("a weight = %v", wa)
+	}
+	wantB := (1-tilt)*0.2 + tilt
+	if math.Abs(wb-wantB) > 1e-12 {
+		t.Fatalf("b weight = %v, want %v", wb, wantB)
+	}
+	// With no conditional mass the weights stay proportional to the 4-gram.
+	wa = edgeWeight(outs[0], nil, 0)
+	wb = edgeWeight(outs[1], nil, 0)
+	if math.Abs(wa/wb-4) > 1e-9 {
+		t.Fatalf("untilted ratio = %v, want 4", wa/wb)
 	}
 }
 

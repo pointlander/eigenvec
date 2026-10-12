@@ -8,11 +8,10 @@
 //
 // A prompt is walked as a path of overlapping 4-character nodes. At every
 // node the PageRank scores of the successors are normalized into a
-// distribution over the next character and added to an order-2 model,
-// P(next | the last two characters). That conditional distribution is
-// normalized after each addition. Generation samples it, steps to the
-// successor the sample names, and adds the new node's distribution the
-// same way.
+// distribution over the next character and mixed, with a small weight,
+// into an order-2 model P(next | the last two characters). Generation
+// follows the current 4-gram. The order-2 conditional only tilts that
+// choice. Each step then mixes the new node in the same way.
 package main
 
 import (
@@ -40,6 +39,12 @@ const (
 	order = 4
 	// sumOrder is the order of the summed next-character model.
 	sumOrder = 2
+	// mix is the weight of a new visit in an order-2 conditional.
+	// The previous conditional keeps the rest.
+	mix = 0.15
+	// tilt is the share of a draw taken from the order-2 conditional.
+	// The rest follows the current 4-gram.
+	tilt = 0.15
 )
 
 // context is the order-2 state the summed distribution conditions on.
@@ -293,9 +298,10 @@ func (g *Graph) normalizeSuccessors() {
 	}
 }
 
-// addNext sums this node's normalized next-character distribution into the
-// order-2 context given by the token's last two characters, then normalizes
-// that conditional distribution so its entries sum to one.
+// addNext mixes this node's next-character distribution into the order-2
+// context given by the token's last two characters. A new visit has weight
+// mix and the previous conditional keeps the rest. The result is normalized
+// so its entries sum to one.
 func (g *Graph) addNext(model map[context]map[rune]float64, node int) {
 	ctx := contextOf(g.token[node])
 	dist := model[ctx]
@@ -303,8 +309,12 @@ func (g *Graph) addNext(model map[context]map[rune]float64, node int) {
 		dist = make(map[rune]float64)
 		model[ctx] = dist
 	}
+	keep := 1 - mix
+	for ch := range dist {
+		dist[ch] *= keep
+	}
 	for _, e := range g.outs[node] {
-		dist[e.ch] += e.p
+		dist[e.ch] += mix * e.p
 	}
 	normalizeDist(dist)
 }
@@ -331,11 +341,9 @@ func normalizeDist(dist map[rune]float64) {
 	}
 }
 
-// generate walks prompt, summing next-character probabilities into an
-// order-2 model and normalizing after each token, then samples the
-// conditional distribution for the current token's last two characters.
-// Each sample steps to the named successor and adds that node's
-// distribution the same way.
+// generate walks the prompt, mixing each token into the order-2 model.
+// Each sample follows the current 4-gram, tilted by that model, then
+// steps to the successor and mixes the new node in.
 func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 	if len(prompt) < order {
 		log.Fatalf("prompt must contain at least %d characters", order)
@@ -369,41 +377,52 @@ func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 	return out
 }
 
-// sample draws a successor with probability proportional to the order-2
-// conditional distribution for the current context. The draw is restricted
-// to edges out of the current node so the walk lands on a PageRank node.
-// If none of those characters have mass yet, it falls back to the node's
-// own normalized PageRank distribution.
+// edgeWeight is the current 4-gram's edge probability, tilted by the
+// order-2 conditional. The conditional is renormalized over the legal
+// successors. A character the conditional has not seen keeps its 4-gram
+// share.
+func edgeWeight(e edge, dist map[rune]float64, priorSum float64) float64 {
+	w := (1 - tilt) * e.p
+	if priorSum > 0 {
+		w += tilt * dist[e.ch] / priorSum
+	}
+	return w
+}
+
+// sample draws a successor of the current 4-gram. The order-2 conditional
+// only tilts the 4-gram probabilities.
 func sample(dist map[rune]float64, outs []edge, rng *rand.Rand) edge {
-	total := 0.0
+	priorSum := 0.0
 	for _, e := range outs {
-		if w := dist[e.ch]; w > 0 {
-			total += w
+		if p := dist[e.ch]; p > 0 {
+			priorSum += p
 		}
 	}
-	useRank := total == 0
-	if useRank {
-		for _, e := range outs {
-			total += e.p
-		}
+	total := 0.0
+	for _, e := range outs {
+		total += edgeWeight(e, dist, priorSum)
 	}
 	if total == 0 {
 		return outs[rng.IntN(len(outs))]
 	}
 	r := rng.Float64() * total
 	acc := 0.0
+	var last edge
+	seen := false
 	for _, e := range outs {
-		w := e.p
-		if !useRank {
-			w = dist[e.ch]
-			if w <= 0 {
-				continue
-			}
+		w := edgeWeight(e, dist, priorSum)
+		if w <= 0 {
+			continue
 		}
+		last = e
+		seen = true
 		acc += w
 		if r <= acc {
 			return e
 		}
+	}
+	if seen {
+		return last
 	}
 	return outs[len(outs)-1]
 }
