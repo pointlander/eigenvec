@@ -9,10 +9,12 @@
 // A prompt is walked as a path of overlapping 6-character nodes. At every
 // node the count-weighted PageRank of the successors is normalized into a
 // distribution over the next character and mixed, with a small weight,
-// into an order-2 model P(next | the last two characters). Generation
-// follows that distribution, softened by a temperature slightly above 1.
-// The order-2 conditional only tilts the choice. Each step then mixes the
-// new node in the same way.
+// into an order-2 model P(next | the last two characters). Each new
+// character is chosen by Monte Carlo tree search. That distribution,
+// softened by a temperature slightly above 1 and tilted by the order-2
+// conditional, is the prior. A rollout scores a path by the geometric mean
+// of those probabilities, and the character is drawn from the visit counts.
+// Each committed step then mixes the new node in the same way.
 package main
 
 import (
@@ -48,6 +50,12 @@ const (
 	tilt = 0.15
 	// temp softens the token distribution. 1 leaves it unchanged.
 	temp = 1.5
+	// mctsSims is the number of simulations behind each generated character.
+	mctsSims = 32
+	// mctsDepth is how far a simulation looks ahead, in characters.
+	mctsDepth = 16
+	// mctsC is the PUCT exploration constant.
+	mctsC = 1.5
 )
 
 // context is the order-2 state the summed distribution conditions on.
@@ -405,8 +413,8 @@ func normalizeDist(dist map[rune]float64) {
 }
 
 // generate walks the prompt, mixing each token into the order-2 model.
-// Each sample follows the current token, softened by temp and tilted by
-// that model, then steps to the successor and mixes the new node in.
+// Each character is chosen by Monte Carlo tree search from the current
+// token, then the walk steps to that successor and mixes the new node in.
 func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 	if len(prompt) < order {
 		log.Fatalf("prompt must contain at least %d characters", order)
@@ -428,11 +436,10 @@ func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 	rng := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
 	out := append([]rune(nil), prompt...)
 	for len(out) < len(prompt)+n {
-		outs := g.outs[cur]
-		if len(outs) == 0 {
+		if len(g.outs[cur]) == 0 {
 			break
 		}
-		e := sample(model[contextOf(g.token[cur])], outs, rng)
+		e := g.search(model, cur, rng)
 		out = append(out, e.ch)
 		cur = e.to
 		g.addNext(model, cur)
@@ -452,9 +459,9 @@ func edgeWeight(e edge, dist map[rune]float64, priorSum float64) float64 {
 	return w
 }
 
-// sample draws a successor of the current token. The token distribution is
-// softened by temp, then the order-2 conditional tilts it.
-func sample(dist map[rune]float64, outs []edge, rng *rand.Rand) edge {
+// edgeWeights is the tempered token distribution tilted by the order-2
+// conditional, one weight per outgoing edge.
+func edgeWeights(dist map[rune]float64, outs []edge) []float64 {
 	priorSum := 0.0
 	for _, e := range outs {
 		if p := dist[e.ch]; p > 0 {
@@ -462,35 +469,51 @@ func sample(dist map[rune]float64, outs []edge, rng *rand.Rand) edge {
 		}
 	}
 	grams := temper(outs)
-	total := 0.0
 	weights := make([]float64, len(outs))
 	for i, e := range outs {
 		e.p = grams[i]
 		weights[i] = edgeWeight(e, dist, priorSum)
-		total += weights[i]
+	}
+	return weights
+}
+
+// sample draws a successor of the current token. The token distribution is
+// softened by temp, then the order-2 conditional tilts it.
+func sample(dist map[rune]float64, outs []edge, rng *rand.Rand) edge {
+	e, _ := sampleProb(dist, outs, rng)
+	return e
+}
+
+// sampleProb draws a successor and returns its share of the model distribution.
+func sampleProb(dist map[rune]float64, outs []edge, rng *rand.Rand) (edge, float64) {
+	weights := edgeWeights(dist, outs)
+	total := 0.0
+	for _, w := range weights {
+		total += w
 	}
 	if total == 0 {
-		return outs[rng.IntN(len(outs))]
+		i := rng.IntN(len(outs))
+		return outs[i], 1 / float64(len(outs))
 	}
 	r := rng.Float64() * total
 	acc := 0.0
-	var last edge
+	last := 0
 	seen := false
-	for i, e := range outs {
+	for i := range outs {
 		if weights[i] <= 0 {
 			continue
 		}
-		last = e
+		last = i
 		seen = true
 		acc += weights[i]
 		if r <= acc {
-			return e
+			return outs[i], weights[i] / total
 		}
 	}
-	if seen {
-		return last
+	if !seen {
+		last = len(outs) - 1
 	}
-	return outs[len(outs)-1]
+	return outs[last], weights[last] / total
 }
 
 // temper raises each edge probability to 1/temp and renormalizes, which
@@ -518,6 +541,178 @@ func temper(outs []edge) []float64 {
 		grams[i] /= sum
 	}
 	return grams
+}
+
+// mctsChild is one explored continuation of an mctsNode.
+type mctsChild struct {
+	prior  float64
+	visits float64
+	value  float64
+	edge   edge
+	node   *mctsNode
+}
+
+// mctsNode is a position in the search tree. id is the graph node.
+type mctsNode struct {
+	id       int
+	visits   float64
+	expanded bool
+	children []mctsChild
+}
+
+// search chooses the next edge by Monte Carlo tree search and draws it
+// from the root visit counts. A node with one continuation is returned as it is.
+func (g *Graph) search(model map[context]map[rune]float64, cur int, rng *rand.Rand) edge {
+	root := g.explore(model, cur, rng)
+	return root.draw(rng)
+}
+
+// explore runs the simulations from cur and returns the search root.
+func (g *Graph) explore(model map[context]map[rune]float64, cur int, rng *rand.Rand) *mctsNode {
+	root := &mctsNode{id: cur}
+	g.expand(root, model)
+	if len(root.children) <= 1 {
+		for i := range root.children {
+			root.children[i].visits = 1
+		}
+		return root
+	}
+	for range mctsSims {
+		g.playout(root, model, rng)
+	}
+	return root
+}
+
+// expand attaches one child per outgoing edge. The prior is the model's
+// sampling distribution at this node.
+func (g *Graph) expand(n *mctsNode, model map[context]map[rune]float64) {
+	if n.expanded {
+		return
+	}
+	n.expanded = true
+	outs := g.outs[n.id]
+	if len(outs) == 0 {
+		return
+	}
+	weights := edgeWeights(model[contextOf(g.token[n.id])], outs)
+	sum := 0.0
+	for _, w := range weights {
+		sum += w
+	}
+	n.children = make([]mctsChild, len(outs))
+	for i, e := range outs {
+		p := 1 / float64(len(outs))
+		if sum > 0 {
+			p = weights[i] / sum
+		}
+		n.children[i] = mctsChild{prior: p, edge: e}
+	}
+}
+
+// playout walks the tree by PUCT, rolls out the rest of the horizon, and
+// backs up the geometric mean of the model probabilities along each suffix.
+func (g *Graph) playout(root *mctsNode, model map[context]map[rune]float64, rng *rand.Rand) {
+	node := root
+	path := make([]*mctsChild, 0, mctsDepth)
+	seq := make([]float64, 0, mctsDepth)
+	for len(path) < mctsDepth && node.expanded && len(node.children) > 0 {
+		c := node.pick()
+		if c.node == nil {
+			c.node = &mctsNode{id: c.edge.to}
+		}
+		path = append(path, c)
+		node = c.node
+		seq = append(seq, logP(c.prior))
+		if !node.expanded {
+			break
+		}
+	}
+	if !node.expanded {
+		g.expand(node, model)
+	}
+	id := node.id
+	for len(seq) < mctsDepth {
+		outs := g.outs[id]
+		if len(outs) == 0 {
+			break
+		}
+		e, p := sampleProb(model[contextOf(g.token[id])], outs, rng)
+		id = e.to
+		seq = append(seq, logP(p))
+	}
+	if len(seq) == 0 {
+		return
+	}
+	root.visits++
+	for i, c := range path {
+		c.visits++
+		c.value += math.Exp(meanFrom(seq, i))
+		if i+1 < len(path) {
+			c.node.visits++
+		}
+	}
+}
+
+// logP is the log of a model probability, floored so a zero stays finite.
+func logP(p float64) float64 {
+	if p < 1e-12 {
+		return math.Log(1e-12)
+	}
+	return math.Log(p)
+}
+
+// pick selects the child with the highest PUCT score. Ties keep the
+// earlier edge, and edges are ordered by character.
+func (n *mctsNode) pick() *mctsChild {
+	sqrtN := math.Sqrt(n.visits + 1)
+	best := 0
+	bestU := math.Inf(-1)
+	for i := range n.children {
+		c := &n.children[i]
+		q := 0.0
+		if c.visits > 0 {
+			q = c.value / c.visits
+		}
+		u := q + mctsC*c.prior*sqrtN/(1+c.visits)
+		if u > bestU {
+			best = i
+			bestU = u
+		}
+	}
+	return &n.children[best]
+}
+
+// draw samples an edge in proportion to how often search visited it.
+func (n *mctsNode) draw(rng *rand.Rand) edge {
+	total := 0.0
+	for i := range n.children {
+		total += n.children[i].visits
+	}
+	if total == 0 {
+		return n.children[rng.IntN(len(n.children))].edge
+	}
+	r := rng.Float64() * total
+	acc := 0.0
+	var last edge
+	for i := range n.children {
+		if n.children[i].visits <= 0 {
+			continue
+		}
+		last = n.children[i].edge
+		acc += n.children[i].visits
+		if r <= acc {
+			return n.children[i].edge
+		}
+	}
+	return last
+}
+
+func meanFrom(v []float64, i int) float64 {
+	sum := 0.0
+	for _, x := range v[i:] {
+		sum += x
+	}
+	return sum / float64(len(v)-i)
 }
 
 // printTop writes the highest-ranking tokens.

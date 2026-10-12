@@ -6,6 +6,7 @@ package main
 
 import (
 	"math"
+	"math/rand/v2"
 	"strings"
 	"testing"
 )
@@ -242,6 +243,60 @@ func TestEdgeProbabilityUsesCountAndRank(t *testing.T) {
 	}
 	if math.Abs(pq/pz-(wq*rq)/(wz*rz)) > 1e-9 {
 		t.Fatalf("p ratio %v, want count*rank ratio %v", pq/pz, (wq*rq)/(wz*rz))
+	}
+}
+
+func TestMCTSLooksAhead(t *testing.T) {
+	// 'a' is the likelier next character, then the walk enters a flat node.
+	// 'b' is less likely now and certain afterwards. Visit counts should
+	// follow the whole horizon, so 'b' is searched more.
+	flat := make([]edge, 10)
+	for i := range flat {
+		flat[i] = edge{to: 1, w: 1, ch: rune('c' + i), p: 0.1}
+	}
+	g := &Graph{
+		outs: [][]edge{
+			{
+				{to: 1, w: 1, ch: 'a', p: 0.65},
+				{to: 2, w: 1, ch: 'b', p: 0.35},
+			},
+			flat,
+			{{to: 2, w: 1, ch: 'b', p: 1}},
+		},
+		token: make([]token, 3),
+	}
+	rng := rand.New(rand.NewPCG(1, 1^0x9e3779b97f4a7c15))
+	root := g.explore(nil, 0, rng)
+	var a, b float64
+	for _, c := range root.children {
+		switch c.edge.ch {
+		case 'a':
+			a = c.visits
+		case 'b':
+			b = c.visits
+		}
+	}
+	if b <= a {
+		t.Fatalf("lookahead visits b=%v, local favorite a=%v", b, a)
+	}
+
+	again := g.explore(nil, 0, rand.New(rand.NewPCG(1, 1^0x9e3779b97f4a7c15)))
+	for i := range root.children {
+		if again.children[i].visits != root.children[i].visits {
+			t.Fatalf("visits differ on the same seed at %q", root.children[i].edge.ch)
+		}
+	}
+}
+
+func TestMCTSReturnsTheOnlyEdge(t *testing.T) {
+	g := &Graph{
+		outs:  [][]edge{{{to: 1, w: 1, ch: 'z', p: 1}}},
+		token: make([]token, 2),
+		rank:  []float64{0.4, 0.6},
+	}
+	e := g.search(nil, 0, rand.New(rand.NewPCG(3, 4)))
+	if e.ch != 'z' || e.to != 1 {
+		t.Fatalf("search = %+v, want the only edge", e)
 	}
 }
 
