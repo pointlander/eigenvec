@@ -7,11 +7,12 @@
 // transition matrix), and generates text from that ranking.
 //
 // A prompt is walked as a path of overlapping 4-character nodes. At every
-// node the PageRank scores of the successor nodes are normalized into a
-// distribution over the next character and added to a running distribution,
-// which is normalized again after each addition. Generation samples that
-// distribution, steps to the successor the sample names, and adds the
-// successor's next-character distribution in the same way.
+// node the PageRank scores of the successors are normalized into a
+// distribution over the next character and added to an order-2 model,
+// P(next | the last two characters). That conditional distribution is
+// normalized after each addition. Generation samples it, steps to the
+// successor the sample names, and adds the new node's distribution the
+// same way.
 package main
 
 import (
@@ -37,7 +38,12 @@ const (
 	maxRankIter = 10000
 	// order is the number of characters in a Markov token.
 	order = 4
+	// sumOrder is the order of the summed next-character model.
+	sumOrder = 2
 )
+
+// context is the order-2 state the summed distribution conditions on.
+type context [sumOrder]rune
 
 // token is an order-4 Markov state: four successive characters.
 type token [order]rune
@@ -287,13 +293,27 @@ func (g *Graph) normalizeSuccessors() {
 	}
 }
 
-// addNext sums this node's normalized next-character distribution into dist,
-// then normalizes dist so its entries sum to one.
-func (g *Graph) addNext(dist map[rune]float64, node int) {
+// addNext sums this node's normalized next-character distribution into the
+// order-2 context given by the token's last two characters, then normalizes
+// that conditional distribution so its entries sum to one.
+func (g *Graph) addNext(model map[context]map[rune]float64, node int) {
+	ctx := contextOf(g.token[node])
+	dist := model[ctx]
+	if dist == nil {
+		dist = make(map[rune]float64)
+		model[ctx] = dist
+	}
 	for _, e := range g.outs[node] {
 		dist[e.ch] += e.p
 	}
 	normalizeDist(dist)
+}
+
+// contextOf is the order-2 state a token predicts from: its last two characters.
+func contextOf(t token) context {
+	var c context
+	copy(c[:], t[order-sumOrder:])
+	return c
 }
 
 // normalizeDist scales dist so its entries sum to one.
@@ -311,21 +331,23 @@ func normalizeDist(dist map[rune]float64) {
 	}
 }
 
-// generate walks prompt, summing a next-character distribution and
-// normalizing after each token, then samples it. Each sample steps to the
-// named successor and adds that node's next-character distribution the same way.
+// generate walks prompt, summing next-character probabilities into an
+// order-2 model and normalizing after each token, then samples the
+// conditional distribution for the current token's last two characters.
+// Each sample steps to the named successor and adds that node's
+// distribution the same way.
 func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 	if len(prompt) < order {
 		log.Fatalf("prompt must contain at least %d characters", order)
 	}
-	dist := make(map[rune]float64)
+	model := make(map[context]map[rune]float64)
 	cur := -1
 	for i := 0; i+order <= len(prompt); i++ {
 		node, ok := g.id[tokenFrom(prompt[i:i+order])]
 		if !ok {
 			continue
 		}
-		g.addNext(dist, node)
+		g.addNext(model, node)
 		cur = node
 	}
 	if cur < 0 {
@@ -339,18 +361,19 @@ func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 		if len(outs) == 0 {
 			break
 		}
-		e := sample(dist, outs, rng)
+		e := sample(model[contextOf(g.token[cur])], outs, rng)
 		out = append(out, e.ch)
 		cur = e.to
-		g.addNext(dist, cur)
+		g.addNext(model, cur)
 	}
 	return out
 }
 
-// sample draws a successor with probability proportional to the summed
-// distribution. The draw is restricted to edges out of the current node so
-// the walk lands on a PageRank node. If none of those characters have mass
-// yet, it falls back to the node's own normalized PageRank distribution.
+// sample draws a successor with probability proportional to the order-2
+// conditional distribution for the current context. The draw is restricted
+// to edges out of the current node so the walk lands on a PageRank node.
+// If none of those characters have mass yet, it falls back to the node's
+// own normalized PageRank distribution.
 func sample(dist map[rune]float64, outs []edge, rng *rand.Rand) edge {
 	total := 0.0
 	for _, e := range outs {
