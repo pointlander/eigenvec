@@ -22,10 +22,13 @@
 package main
 
 import (
+	"archive/tar"
+	"archive/zip"
 	"bufio"
 	"cmp"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"math/rand/v2"
@@ -91,13 +94,28 @@ func main() {
 	n := flag.Int("n", 400, "characters to generate after the prompt")
 	seed := flag.Uint64("seed", 1, "sampling seed")
 	top := flag.Int("top", 12, "how many PageRank tokens to print")
+	gutenberg := flag.Int("gutenberg", 0, "also train on the first n books in txt-files.tar.zip")
 	flag.Parse()
+	if *gutenberg < 0 {
+		log.Fatal("-gutenberg must be >= 0")
+	}
 
 	text, err := os.ReadFile(*file)
 	if err != nil {
 		log.Fatal(err)
 	}
-	runes := []rune(prepare(string(text)))
+	body := prepare(string(text))
+	if *gutenberg > 0 {
+		extra, err := readGutenberg("txt-files.tar.zip", *gutenberg)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Fprintf(os.Stderr, "gutenberg books %d\n", *gutenberg)
+		if extra != "" {
+			body += "\n" + extra
+		}
+	}
+	runes := []rune(body)
 	if len(runes) < order+1 {
 		log.Fatalf("text is shorter than an order-%d transition", order)
 	}
@@ -156,6 +174,68 @@ func prepare(s string) string {
 		b.WriteByte(s[i])
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// readGutenberg returns the prepared text of the first n books in
+// txt-files.tar.zip. Books are the .txt members of txt-files.tar, in the
+// order they are stored. The books are separated by a newline.
+func readGutenberg(path string, n int) (string, error) {
+	z, err := zip.OpenReader(path)
+	if err != nil {
+		return "", err
+	}
+	defer z.Close()
+	var member *zip.File
+	for _, f := range z.File {
+		if f.Name == "txt-files.tar" || strings.HasSuffix(f.Name, "/txt-files.tar") {
+			member = f
+			break
+		}
+	}
+	if member == nil {
+		return "", fmt.Errorf("%s has no txt-files.tar", path)
+	}
+	r, err := member.Open()
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
+	return readBooks(tar.NewReader(r), n)
+}
+
+// readBooks prepares the first n .txt files from tr.
+func readBooks(tr *tar.Reader, n int) (string, error) {
+	var b strings.Builder
+	got := 0
+	for got < n {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+		if !hdr.FileInfo().Mode().IsRegular() || !strings.HasSuffix(hdr.Name, ".txt") {
+			continue
+		}
+		var buf strings.Builder
+		if _, err := io.Copy(&buf, tr); err != nil {
+			return "", err
+		}
+		got++
+		text := prepare(buf.String())
+		if text == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(text)
+	}
+	if got < n {
+		return "", fmt.Errorf("txt-files.tar.zip has %d books, want %d", got, n)
+	}
+	return b.String(), nil
 }
 
 // cleanLines trims leading spaces, drops a verse number that sits at the

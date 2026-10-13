@@ -5,11 +5,70 @@
 package main
 
 import (
+	"archive/tar"
+	"archive/zip"
+	"bytes"
 	"math"
 	"math/rand/v2"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestReadGutenbergTakesFirstBooks(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "txt-files.tar.zip")
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	add := func(name, body string) {
+		t.Helper()
+		b := []byte(body)
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(b))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("cache/epub/1/notes.dat", "skip me")
+	add("cache/epub/1/pg1.txt", "HEADER\n*** START OF THE PROJECT GUTENBERG EBOOK X\nAlpha.\n*** END OF THE PROJECT GUTENBERG EBOOK X\nlicense")
+	add("cache/epub/2/", "")
+	add("cache/epub/2/pg2.txt", "Beta.")
+	add("cache/epub/3/pg3.txt", "Gamma.")
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	w, err := zw.Create("txt-files.tar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(tarBuf.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := readGutenberg(path, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "Alpha.\nBeta." {
+		t.Fatalf("readGutenberg = %q", got)
+	}
+	if _, err := readGutenberg(path, 4); err == nil {
+		t.Fatal("expected an error when fewer than 4 books are present")
+	}
+}
 
 func TestPageRankKnownGraph(t *testing.T) {
 	// Weighted graph from the alixaxel/pagerank README, solved to 1e-15.
