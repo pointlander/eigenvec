@@ -13,8 +13,10 @@
 // The program decays that context's weights, adds the new visit, and
 // normalizes. Each new character is chosen by Monte Carlo tree search.
 // The tempered token distribution, tilted by that table, is rescaled by
-// the symbol under the head of Wolfram's 2-state 3-symbol machine. That
-// machine is universal, and its tape grows in both directions. A rollout
+// the symbol under the head of Wolfram's 2-state 3-symbol machine.
+// Closing a frequent word such as "the" is discounted by how often the
+// corpus uses it. The machine is universal, and its tape grows in both
+// directions. A rollout
 // scores a path by the geometric mean of those probabilities, and the
 // character is drawn from the visit counts. Each committed step runs the
 // table program and advances the universal machine one transition.
@@ -36,6 +38,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 const (
@@ -63,6 +66,9 @@ const (
 	mctsDepth = 16
 	// mctsC is the PUCT exploration constant.
 	mctsC = 1.5
+	// freq discounts closing a word in proportion to how often the corpus
+	// uses it. 0 leaves frequent words at their token probability.
+	freq = 0.5
 )
 
 // context is the order-2 state the summed distribution conditions on.
@@ -86,6 +92,8 @@ type Graph struct {
 	token []token
 	id    map[token]int
 	rank  []float64
+	// words counts lowercased words in the text. A word is a run of letters.
+	words map[string]int
 }
 
 func main() {
@@ -333,6 +341,7 @@ func buildGraph(runes []rune) *Graph {
 		outs:  make([][]edge, len(keys)),
 		token: keys,
 		id:    make(map[token]int, len(keys)),
+		words: wordCounts(runes),
 	}
 	for i, tok := range keys {
 		g.id[tok] = i
@@ -353,6 +362,56 @@ func buildGraph(runes []rune) *Graph {
 		g.outs[from] = edges
 	}
 	return g
+}
+
+// wordCounts counts maximal runs of letters, folded to lower case.
+func wordCounts(runes []rune) map[string]int {
+	counts := make(map[string]int)
+	for i := 0; i < len(runes); {
+		if !isLetter(runes[i]) {
+			i++
+			continue
+		}
+		j := i + 1
+		for j < len(runes) && isLetter(runes[j]) {
+			j++
+		}
+		counts[strings.ToLower(string(runes[i:j]))]++
+		i = j
+	}
+	return counts
+}
+
+func isLetter(r rune) bool {
+	return unicode.IsLetter(r)
+}
+
+// trailingWord is the lowercased run of letters at the end of t.
+func trailingWord(t token) string {
+	i := order
+	for i > 0 && isLetter(t[i-1]) {
+		i--
+	}
+	if i == order {
+		return ""
+	}
+	return strings.ToLower(string(t[i:]))
+}
+
+// closePenalty is below one when ch ends a word the corpus uses often.
+func (g *Graph) closePenalty(tok token, ch rune) float64 {
+	if g.words == nil || isLetter(ch) {
+		return 1
+	}
+	word := trailingWord(tok)
+	if word == "" {
+		return 1
+	}
+	c := g.words[word]
+	if c <= 1 {
+		return 1
+	}
+	return 1 / (1 + freq*math.Log(float64(c)))
 }
 
 func tokenFrom(rs []rune) token {
@@ -378,17 +437,23 @@ func (g *Graph) edgeCount() int {
 }
 
 // rankPages computes weighted PageRank by power iteration.
-// The result is the unique positive eigenvector of the Google matrix,
-// normalized to sum to one.
+// A link is weighted by the log of its occurrence count. The result is the
+// unique positive eigenvector of the Google matrix, normalized to sum to one.
 func (g *Graph) rankPages(damp, tol float64) int {
 	n := len(g.outs)
 	if n == 0 {
 		return 0
 	}
+	// lw is parallel to outs. log(1) is zero, so a once-seen link sends no rank.
+	lw := make([][]float64, n)
 	outw := make([]float64, n)
 	for i, outs := range g.outs {
-		for _, e := range outs {
-			outw[i] += e.w
+		lw[i] = make([]float64, len(outs))
+		for j, e := range outs {
+			if e.w > 1 {
+				lw[i][j] = math.Log(e.w)
+			}
+			outw[i] += lw[i][j]
 		}
 	}
 	rank := make([]float64, n)
@@ -411,8 +476,8 @@ func (g *Graph) rankPages(damp, tol float64) int {
 				continue
 			}
 			scale := damp * rank[i] / outw[i]
-			for _, e := range outs {
-				next[e.to] += scale * e.w
+			for j, e := range outs {
+				next[e.to] += scale * lw[i][j]
 			}
 		}
 		if dangling > 0 {
@@ -571,14 +636,30 @@ func temper(outs []edge) []float64 {
 	return grams
 }
 
-// sampleProb draws a successor and returns its share of the tilted distribution
-// after the universal machine rescales it.
-func sampleProb(dist map[rune]float64, outs []edge, cpu *Machine, rng *rand.Rand) (edge, float64) {
+// priorWeights is the tempered, tilted distribution, rescaled by the
+// universal machine and by the penalty for closing a frequent word.
+func (g *Graph) priorWeights(dist map[rune]float64, id int, outs []edge, cpu *Machine) []float64 {
 	weights := edgeWeights(dist, outs)
-	total := 0.0
+	var tok token
+	have := id >= 0 && id < len(g.token)
+	if have {
+		tok = g.token[id]
+	}
 	for i, e := range outs {
 		weights[i] *= cpu.bias(e.ch)
-		total += weights[i]
+		if have {
+			weights[i] *= g.closePenalty(tok, e.ch)
+		}
+	}
+	return weights
+}
+
+// sampleProb draws a successor and returns its share of priorWeights.
+func (g *Graph) sampleProb(dist map[rune]float64, id int, outs []edge, cpu *Machine, rng *rand.Rand) (edge, float64) {
+	weights := g.priorWeights(dist, id, outs, cpu)
+	total := 0.0
+	for _, w := range weights {
+		total += w
 	}
 	if total == 0 {
 		i := rng.IntN(len(outs))
@@ -657,11 +738,10 @@ func (g *Graph) expand(n *mctsNode, table, cpu *Machine) {
 	if len(outs) == 0 {
 		return
 	}
-	weights := edgeWeights(g.distAt(table, n.id), outs)
+	weights := g.priorWeights(g.distAt(table, n.id), n.id, outs, cpu)
 	sum := 0.0
-	for i, e := range outs {
-		weights[i] *= cpu.bias(e.ch)
-		sum += weights[i]
+	for _, w := range weights {
+		sum += w
 	}
 	n.children = make([]mctsChild, len(outs))
 	for i, e := range outs {
@@ -700,7 +780,7 @@ func (g *Graph) playout(root *mctsNode, table, cpu *Machine, rng *rand.Rand) {
 		if len(outs) == 0 {
 			break
 		}
-		e, p := sampleProb(g.distAt(table, id), outs, cpu, rng)
+		e, p := g.sampleProb(g.distAt(table, id), id, outs, cpu, rng)
 		id = e.to
 		seq = append(seq, logP(p))
 	}

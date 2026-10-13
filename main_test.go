@@ -72,11 +72,12 @@ func TestReadGutenbergTakesFirstBooks(t *testing.T) {
 
 func TestPageRankKnownGraph(t *testing.T) {
 	// Weighted graph from the alixaxel/pagerank README, solved to 1e-15.
-	// Node 4 is dangling.
+	// Node 4 is dangling. Stored weights are the exponentials of the README
+	// weights, because rankPages takes the log before it walks the links.
 	g := &Graph{outs: make([][]edge, 4)}
-	g.outs[0] = []edge{{to: 1, w: 1}, {to: 2, w: 2}}
-	g.outs[1] = []edge{{to: 2, w: 3}, {to: 3, w: 4}}
-	g.outs[2] = []edge{{to: 0, w: 5}}
+	g.outs[0] = []edge{{to: 1, w: math.Exp(1)}, {to: 2, w: math.Exp(2)}}
+	g.outs[1] = []edge{{to: 2, w: math.Exp(3)}, {to: 3, w: math.Exp(4)}}
+	g.outs[2] = []edge{{to: 0, w: math.Exp(5)}}
 	iters := g.rankPages(0.85, 1e-15)
 	if iters <= 1 || iters >= maxRankIter {
 		t.Fatalf("iterations = %d", iters)
@@ -260,6 +261,37 @@ func TestPromptSumsNextCharacterMass(t *testing.T) {
 	}
 	if separateDist['a'] <= 0 {
 		t.Fatalf("separate conditional = %v, want mass on 'a'", separateDist)
+	}
+}
+
+func TestCommonWordIsDiscounted(t *testing.T) {
+	// "x the" closed by a space is the frequent word. 'm' continues it
+	// into another word, so that edge is not a close. A rare word keeps
+	// equal weights on its two exits.
+	var commonTok, rareTok token
+	copy(commonTok[:], []rune("xx the"))
+	copy(rareTok[:], []rune("xxx ox"))
+	g := &Graph{
+		token: []token{commonTok, rareTok},
+		words: map[string]int{"the": 1000, "ox": 1},
+		outs: [][]edge{
+			{
+				{to: 1, w: 1, ch: ' ', p: 0.5},
+				{to: 1, w: 1, ch: 'm', p: 0.5},
+			},
+			{
+				{to: 0, w: 1, ch: ' ', p: 0.5},
+				{to: 0, w: 1, ch: 'e', p: 0.5},
+			},
+		},
+	}
+	commonW := g.priorWeights(nil, 0, g.outs[0], nil)
+	if commonW[0] >= commonW[1] {
+		t.Fatalf("closing \"the\" %v is not below continuing %v", commonW[0], commonW[1])
+	}
+	rareW := g.priorWeights(nil, 1, g.outs[1], nil)
+	if math.Abs(rareW[0]-rareW[1]) > 1e-12 {
+		t.Fatalf("rare word weights %v %v", rareW[0], rareW[1])
 	}
 }
 
