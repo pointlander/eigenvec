@@ -11,11 +11,12 @@
 // distribution over the next character and mixed, with a small weight,
 // into an order-2 conditional kept by a program on a Turing machine's tape.
 // The program decays that context's weights, adds the new visit, and
-// normalizes. Value iteration stores, on each node, how likely a rollout
-// from there stays under the tempered token distribution. Each new
-// character is drawn from that distribution, tilted by the table the
-// program wrote, and multiplied by the successor's continuation value.
-// Each committed step runs the program again.
+// normalizes. Each new character is chosen by Monte Carlo tree search.
+// The tempered token distribution, tilted by the table the program wrote,
+// is the prior. A rollout scores a path by the geometric mean of those
+// probabilities, and the character is drawn from the visit counts. Each
+// committed step runs the program on the node that was chosen. A rollout
+// only reads the table.
 package main
 
 import (
@@ -51,8 +52,12 @@ const (
 	tilt = 0.15
 	// temp softens the token distribution. 1 leaves it unchanged.
 	temp = 1.5
-	// horizon is how many edges a continuation value looks ahead.
-	horizon = 16
+	// mctsSims is the number of simulations behind each generated character.
+	mctsSims = 32
+	// mctsDepth is how far a simulation looks ahead, in characters.
+	mctsDepth = 16
+	// mctsC is the PUCT exploration constant.
+	mctsC = 1.5
 )
 
 // context is the order-2 state the summed distribution conditions on.
@@ -76,8 +81,6 @@ type Graph struct {
 	token []token
 	id    map[token]int
 	rank  []float64
-	// cont is the per-step probability of a horizon-step rollout from this node.
-	cont []float64
 }
 
 func main() {
@@ -100,7 +103,6 @@ func main() {
 	g := buildGraph(runes)
 	iters := g.rankPages(damp, tol)
 	g.normalizeSuccessors()
-	g.scoreContinuations()
 
 	fmt.Fprintf(os.Stderr, "tokens %d edges %d pagerank iterations %d\n", len(g.token), g.edgeCount(), iters)
 	g.printTop(os.Stderr, *top)
@@ -392,9 +394,9 @@ func normalizeDist(dist map[rune]float64) {
 }
 
 // generate walks the prompt and runs the tape program on each token, which
-// keeps the order-2 table. Each character is drawn from the current token,
-// tilted by that table and multiplied by the successor's continuation value.
-// The walk then steps to that successor and runs the program on the new node.
+// keeps the order-2 table. Each character is chosen by Monte Carlo tree
+// search from the current token. The walk then steps to that successor and
+// runs the program on the new node.
 func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 	if len(prompt) < order {
 		log.Fatalf("prompt must contain at least %d characters", order)
@@ -419,7 +421,7 @@ func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 		if len(g.outs[cur]) == 0 {
 			break
 		}
-		e := g.draw(m.conditional(contextOf(g.token[cur])), cur, rng)
+		e := g.search(m, cur, rng)
 		out = append(out, e.ch)
 		cur = e.to
 		m.observe(g, cur)
@@ -484,82 +486,210 @@ func temper(outs []edge) []float64 {
 	return grams
 }
 
-// scoreContinuations stores the per-step probability of a horizon-step
-// rollout under the tempered token distribution. A missing step, including
-// every step from a node with no outgoing edge, scores as a near-zero probability.
-func (g *Graph) scoreContinuations() {
-	n := len(g.outs)
-	pi := make([][]float64, n)
-	logpi := make([][]float64, n)
-	for i, outs := range g.outs {
-		if len(outs) == 0 {
-			continue
-		}
-		grams := temper(outs)
-		sum := 0.0
-		for _, p := range grams {
-			sum += p
-		}
-		if sum == 0 {
-			continue
-		}
-		pi[i] = grams
-		logpi[i] = make([]float64, len(grams))
-		for j, p := range grams {
-			logpi[i][j] = logP(p)
-		}
-	}
-	floor := logP(0)
-	V := make([]float64, n)
-	next := make([]float64, n)
-	for step := 1; step <= horizon; step++ {
-		for i, outs := range g.outs {
-			if len(outs) == 0 || pi[i] == nil {
-				next[i] = float64(step) * floor
-				continue
-			}
-			s := 0.0
-			for j, e := range outs {
-				s += pi[i][j] * (logpi[i][j] + V[e.to])
-			}
-			next[i] = s
-		}
-		V, next = next, V
-	}
-	g.cont = make([]float64, n)
-	inv := 1 / float64(horizon)
-	for i, v := range V {
-		g.cont[i] = math.Exp(v * inv)
-	}
-}
-
-// draw samples an outgoing edge. The tempered, tilted token distribution is
-// multiplied by the continuation value of the node each edge enters.
-func (g *Graph) draw(dist map[rune]float64, cur int, rng *rand.Rand) edge {
-	outs := g.outs[cur]
+// sampleProb draws a successor and returns its share of the tilted distribution.
+func sampleProb(dist map[rune]float64, outs []edge, rng *rand.Rand) (edge, float64) {
 	weights := edgeWeights(dist, outs)
 	total := 0.0
-	for i, e := range outs {
-		weights[i] *= g.cont[e.to]
-		total += weights[i]
+	for _, w := range weights {
+		total += w
 	}
 	if total == 0 {
-		return outs[rng.IntN(len(outs))]
+		i := rng.IntN(len(outs))
+		return outs[i], 1 / float64(len(outs))
 	}
 	r := rng.Float64() * total
 	acc := 0.0
-	last := outs[0]
-	for i, e := range outs {
+	last := 0
+	seen := false
+	for i := range outs {
 		if weights[i] <= 0 {
 			continue
 		}
-		last = e
+		last = i
+		seen = true
 		acc += weights[i]
 		if r <= acc {
-			return e
+			return outs[i], weights[i] / total
+		}
+	}
+	if !seen {
+		last = len(outs) - 1
+	}
+	return outs[last], weights[last] / total
+}
+
+// mctsChild is one explored continuation of an mctsNode.
+type mctsChild struct {
+	prior  float64
+	visits float64
+	value  float64
+	edge   edge
+	node   *mctsNode
+}
+
+// mctsNode is a position in the search tree. id is the graph node.
+type mctsNode struct {
+	id       int
+	visits   float64
+	expanded bool
+	children []mctsChild
+}
+
+// search chooses the next edge by Monte Carlo tree search and draws it
+// from the root visit counts. A node with one continuation is returned as it is.
+func (g *Graph) search(m *Machine, cur int, rng *rand.Rand) edge {
+	root := g.explore(m, cur, rng)
+	return root.draw(rng)
+}
+
+// explore runs the simulations from cur and returns the search root.
+// The tape is only read. Rollouts do not run the tilt program.
+func (g *Graph) explore(m *Machine, cur int, rng *rand.Rand) *mctsNode {
+	root := &mctsNode{id: cur}
+	g.expand(root, m)
+	if len(root.children) <= 1 {
+		for i := range root.children {
+			root.children[i].visits = 1
+		}
+		return root
+	}
+	for range mctsSims {
+		g.playout(root, m, rng)
+	}
+	return root
+}
+
+// expand attaches one child per outgoing edge. The prior is the tilted
+// distribution at this node.
+func (g *Graph) expand(n *mctsNode, m *Machine) {
+	if n.expanded {
+		return
+	}
+	n.expanded = true
+	outs := g.outs[n.id]
+	if len(outs) == 0 {
+		return
+	}
+	weights := edgeWeights(g.distAt(m, n.id), outs)
+	sum := 0.0
+	for _, w := range weights {
+		sum += w
+	}
+	n.children = make([]mctsChild, len(outs))
+	for i, e := range outs {
+		p := 1 / float64(len(outs))
+		if sum > 0 {
+			p = weights[i] / sum
+		}
+		n.children[i] = mctsChild{prior: p, edge: e}
+	}
+}
+
+// playout walks the tree by PUCT, rolls out the rest of the horizon, and
+// backs up the geometric mean of the model probabilities along each suffix.
+func (g *Graph) playout(root *mctsNode, m *Machine, rng *rand.Rand) {
+	node := root
+	path := make([]*mctsChild, 0, mctsDepth)
+	seq := make([]float64, 0, mctsDepth)
+	for len(path) < mctsDepth && node.expanded && len(node.children) > 0 {
+		c := node.pick()
+		if c.node == nil {
+			c.node = &mctsNode{id: c.edge.to}
+		}
+		path = append(path, c)
+		node = c.node
+		seq = append(seq, logP(c.prior))
+		if !node.expanded {
+			break
+		}
+	}
+	if !node.expanded {
+		g.expand(node, m)
+	}
+	id := node.id
+	for len(seq) < mctsDepth {
+		outs := g.outs[id]
+		if len(outs) == 0 {
+			break
+		}
+		e, p := sampleProb(g.distAt(m, id), outs, rng)
+		id = e.to
+		seq = append(seq, logP(p))
+	}
+	if len(seq) == 0 {
+		return
+	}
+	root.visits++
+	for i, c := range path {
+		c.visits++
+		c.value += math.Exp(meanFrom(seq, i))
+		if i+1 < len(path) {
+			c.node.visits++
+		}
+	}
+}
+
+// distAt reads the order-2 table for this node. A nil machine leaves the
+// token distribution untilted.
+func (g *Graph) distAt(m *Machine, id int) map[rune]float64 {
+	if m == nil || id < 0 || id >= len(g.token) {
+		return nil
+	}
+	return m.conditional(contextOf(g.token[id]))
+}
+
+// pick selects the child with the highest PUCT score. Ties keep the
+// earlier edge, and edges are ordered by character.
+func (n *mctsNode) pick() *mctsChild {
+	sqrtN := math.Sqrt(n.visits + 1)
+	best := 0
+	bestU := math.Inf(-1)
+	for i := range n.children {
+		c := &n.children[i]
+		q := 0.0
+		if c.visits > 0 {
+			q = c.value / c.visits
+		}
+		u := q + mctsC*c.prior*sqrtN/(1+c.visits)
+		if u > bestU {
+			best = i
+			bestU = u
+		}
+	}
+	return &n.children[best]
+}
+
+// draw samples an edge in proportion to how often search visited it.
+func (n *mctsNode) draw(rng *rand.Rand) edge {
+	total := 0.0
+	for i := range n.children {
+		total += n.children[i].visits
+	}
+	if total == 0 {
+		return n.children[rng.IntN(len(n.children))].edge
+	}
+	r := rng.Float64() * total
+	acc := 0.0
+	var last edge
+	for i := range n.children {
+		if n.children[i].visits <= 0 {
+			continue
+		}
+		last = n.children[i].edge
+		acc += n.children[i].visits
+		if r <= acc {
+			return n.children[i].edge
 		}
 	}
 	return last
+}
+
+func meanFrom(v []float64, i int) float64 {
+	sum := 0.0
+	for _, x := range v[i:] {
+		sum += x
+	}
+	return sum / float64(len(v)-i)
 }
 
 // tmKey is the finite control of one Turing transition: a state and the symbol read.

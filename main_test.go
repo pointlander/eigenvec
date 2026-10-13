@@ -45,7 +45,6 @@ func TestGenerateStaysOnObservedEdges(t *testing.T) {
 	g := buildGraph(src)
 	g.rankPages(damp, 1e-14)
 	g.normalizeSuccessors()
-	g.scoreContinuations()
 
 	prompt := []rune("To be or")
 	out := g.generate(prompt, 80, 1)
@@ -254,10 +253,10 @@ func TestEdgeProbabilityUsesCountAndRank(t *testing.T) {
 	}
 }
 
-func TestContinuationPrefersLikelyFuture(t *testing.T) {
-	// 'a' is the likelier next character and enters a flat node.
-	// 'b' is less likely now and certain afterwards. A node with no
-	// outgoing edge has nothing to roll out.
+func TestMCTSLooksAhead(t *testing.T) {
+	// 'a' is the likelier next character, then the walk enters a flat node.
+	// 'b' is less likely now and certain afterwards. Visit counts should
+	// follow the whole horizon, so 'b' is searched more.
 	flat := make([]edge, 10)
 	for i := range flat {
 		flat[i] = edge{to: 1, w: 1, ch: rune('c' + i), p: 0.1}
@@ -270,34 +269,39 @@ func TestContinuationPrefersLikelyFuture(t *testing.T) {
 			},
 			flat,
 			{{to: 2, w: 1, ch: 'b', p: 1}},
-			nil,
 		},
-		token: make([]token, 4),
+		token: make([]token, 3),
 	}
-	g.scoreContinuations()
-	if g.cont[2] <= g.cont[1] {
-		t.Fatalf("certain continuation %v, flat %v", g.cont[2], g.cont[1])
+	rng := rand.New(rand.NewPCG(1, 1^0x9e3779b97f4a7c15))
+	root := g.explore(nil, 0, rng)
+	var a, b float64
+	for _, c := range root.children {
+		switch c.edge.ch {
+		case 'a':
+			a = c.visits
+		case 'b':
+			b = c.visits
+		}
 	}
-	if g.cont[3] >= g.cont[2] {
-		t.Fatalf("dead-end continuation %v, certain %v", g.cont[3], g.cont[2])
+	if b <= a {
+		t.Fatalf("lookahead visits b=%v, local favorite a=%v", b, a)
 	}
-	weights := edgeWeights(nil, g.outs[0])
-	wa := weights[0] * g.cont[1]
-	wb := weights[1] * g.cont[2]
-	if wb <= wa {
-		t.Fatalf("reweighted b=%v, local favorite a=%v", wb, wa)
+	again := g.explore(nil, 0, rand.New(rand.NewPCG(1, 1^0x9e3779b97f4a7c15)))
+	for i := range root.children {
+		if again.children[i].visits != root.children[i].visits {
+			t.Fatalf("visits differ on the same seed at %q", root.children[i].edge.ch)
+		}
 	}
 }
 
-func TestDrawReturnsTheOnlyEdge(t *testing.T) {
+func TestMCTSReturnsTheOnlyEdge(t *testing.T) {
 	g := &Graph{
 		outs:  [][]edge{{{to: 1, w: 1, ch: 'z', p: 1}}, nil},
 		token: make([]token, 2),
 	}
-	g.scoreContinuations()
-	e := g.draw(nil, 0, rand.New(rand.NewPCG(3, 4)))
+	e := g.search(nil, 0, rand.New(rand.NewPCG(3, 4)))
 	if e.ch != 'z' || e.to != 1 {
-		t.Fatalf("draw = %+v, want the only edge", e)
+		t.Fatalf("search = %+v, want the only edge", e)
 	}
 }
 
