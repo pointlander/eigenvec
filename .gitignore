@@ -1,0 +1,19 @@
+# Binaries
+/eigenvec
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test and coverage output
+*.test
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+vendor/
+
+# Local corpora, not used by the generator
+train-v2.0.json
+txt-files.tar.zip
