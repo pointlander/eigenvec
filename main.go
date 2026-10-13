@@ -9,12 +9,14 @@
 // A prompt is walked as a path of overlapping 6-character nodes. At every
 // node the count-weighted PageRank of the successors is normalized into a
 // distribution over the next character and mixed, with a small weight,
-// into an order-2 model P(next | the last two characters). Each new
-// character is chosen by Monte Carlo tree search. That distribution,
-// softened by a temperature slightly above 1 and tilted by the order-2
-// conditional, is the prior. A rollout scores a path by the geometric mean
-// of those probabilities, and the character is drawn from the visit counts.
-// Each committed step then mixes the new node in the same way.
+// into an order-2 model P(next | the last two characters). Value iteration
+// stores, on each node, how likely a rollout from there stays under the
+// tempered token distribution. Each new character is drawn from that
+// distribution, tilted by the order-2 conditional and multiplied by the
+// successor's continuation value and by the symbol under the head of a
+// Turing machine. The machine is Wolfram's 2-state 3-symbol machine, which
+// is universal, on a tape that grows in both directions. Each committed
+// step advances that machine and mixes the new node in.
 package main
 
 import (
@@ -50,12 +52,8 @@ const (
 	tilt = 0.15
 	// temp softens the token distribution. 1 leaves it unchanged.
 	temp = 1.5
-	// mctsSims is the number of simulations behind each generated character.
-	mctsSims = 32
-	// mctsDepth is how far a simulation looks ahead, in characters.
-	mctsDepth = 16
-	// mctsC is the PUCT exploration constant.
-	mctsC = 1.5
+	// horizon is how many edges a continuation value looks ahead.
+	horizon = 16
 )
 
 // context is the order-2 state the summed distribution conditions on.
@@ -79,6 +77,8 @@ type Graph struct {
 	token []token
 	id    map[token]int
 	rank  []float64
+	// cont is the per-step probability of a horizon-step rollout from this node.
+	cont []float64
 }
 
 func main() {
@@ -101,6 +101,7 @@ func main() {
 	g := buildGraph(runes)
 	iters := g.rankPages(damp, tol)
 	g.normalizeSuccessors()
+	g.scoreContinuations()
 
 	fmt.Fprintf(os.Stderr, "tokens %d edges %d pagerank iterations %d\n", len(g.token), g.edgeCount(), iters)
 	g.printTop(os.Stderr, *top)
@@ -413,8 +414,10 @@ func normalizeDist(dist map[rune]float64) {
 }
 
 // generate walks the prompt, mixing each token into the order-2 model.
-// Each character is chosen by Monte Carlo tree search from the current
-// token, then the walk steps to that successor and mixes the new node in.
+// Each character is drawn from the current token, tilted by that model and
+// multiplied by the successor's continuation value and the Turing machine's
+// head symbol. The walk then steps to that successor, advances the machine
+// one transition, and mixes the new node in.
 func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 	if len(prompt) < order {
 		log.Fatalf("prompt must contain at least %d characters", order)
@@ -434,15 +437,17 @@ func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 	}
 
 	rng := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
+	m := machineFromPrompt(prompt)
 	out := append([]rune(nil), prompt...)
 	for len(out) < len(prompt)+n {
 		if len(g.outs[cur]) == 0 {
 			break
 		}
-		e := g.search(model, cur, rng)
+		e := g.draw(model[contextOf(g.token[cur])], cur, m, rng)
 		out = append(out, e.ch)
 		cur = e.to
 		g.addNext(model, cur)
+		m.step()
 	}
 	return out
 }
@@ -477,45 +482,6 @@ func edgeWeights(dist map[rune]float64, outs []edge) []float64 {
 	return weights
 }
 
-// sample draws a successor of the current token. The token distribution is
-// softened by temp, then the order-2 conditional tilts it.
-func sample(dist map[rune]float64, outs []edge, rng *rand.Rand) edge {
-	e, _ := sampleProb(dist, outs, rng)
-	return e
-}
-
-// sampleProb draws a successor and returns its share of the model distribution.
-func sampleProb(dist map[rune]float64, outs []edge, rng *rand.Rand) (edge, float64) {
-	weights := edgeWeights(dist, outs)
-	total := 0.0
-	for _, w := range weights {
-		total += w
-	}
-	if total == 0 {
-		i := rng.IntN(len(outs))
-		return outs[i], 1 / float64(len(outs))
-	}
-	r := rng.Float64() * total
-	acc := 0.0
-	last := 0
-	seen := false
-	for i := range outs {
-		if weights[i] <= 0 {
-			continue
-		}
-		last = i
-		seen = true
-		acc += weights[i]
-		if r <= acc {
-			return outs[i], weights[i] / total
-		}
-	}
-	if !seen {
-		last = len(outs) - 1
-	}
-	return outs[last], weights[last] / total
-}
-
 // temper raises each edge probability to 1/temp and renormalizes, which
 // flattens the token distribution when temp is above 1.
 func temper(outs []edge) []float64 {
@@ -543,114 +509,230 @@ func temper(outs []edge) []float64 {
 	return grams
 }
 
-// mctsChild is one explored continuation of an mctsNode.
-type mctsChild struct {
-	prior  float64
-	visits float64
-	value  float64
-	edge   edge
-	node   *mctsNode
-}
-
-// mctsNode is a position in the search tree. id is the graph node.
-type mctsNode struct {
-	id       int
-	visits   float64
-	expanded bool
-	children []mctsChild
-}
-
-// search chooses the next edge by Monte Carlo tree search and draws it
-// from the root visit counts. A node with one continuation is returned as it is.
-func (g *Graph) search(model map[context]map[rune]float64, cur int, rng *rand.Rand) edge {
-	root := g.explore(model, cur, rng)
-	return root.draw(rng)
-}
-
-// explore runs the simulations from cur and returns the search root.
-func (g *Graph) explore(model map[context]map[rune]float64, cur int, rng *rand.Rand) *mctsNode {
-	root := &mctsNode{id: cur}
-	g.expand(root, model)
-	if len(root.children) <= 1 {
-		for i := range root.children {
-			root.children[i].visits = 1
-		}
-		return root
-	}
-	for range mctsSims {
-		g.playout(root, model, rng)
-	}
-	return root
-}
-
-// expand attaches one child per outgoing edge. The prior is the model's
-// sampling distribution at this node.
-func (g *Graph) expand(n *mctsNode, model map[context]map[rune]float64) {
-	if n.expanded {
-		return
-	}
-	n.expanded = true
-	outs := g.outs[n.id]
-	if len(outs) == 0 {
-		return
-	}
-	weights := edgeWeights(model[contextOf(g.token[n.id])], outs)
-	sum := 0.0
-	for _, w := range weights {
-		sum += w
-	}
-	n.children = make([]mctsChild, len(outs))
-	for i, e := range outs {
-		p := 1 / float64(len(outs))
-		if sum > 0 {
-			p = weights[i] / sum
-		}
-		n.children[i] = mctsChild{prior: p, edge: e}
-	}
-}
-
-// playout walks the tree by PUCT, rolls out the rest of the horizon, and
-// backs up the geometric mean of the model probabilities along each suffix.
-func (g *Graph) playout(root *mctsNode, model map[context]map[rune]float64, rng *rand.Rand) {
-	node := root
-	path := make([]*mctsChild, 0, mctsDepth)
-	seq := make([]float64, 0, mctsDepth)
-	for len(path) < mctsDepth && node.expanded && len(node.children) > 0 {
-		c := node.pick()
-		if c.node == nil {
-			c.node = &mctsNode{id: c.edge.to}
-		}
-		path = append(path, c)
-		node = c.node
-		seq = append(seq, logP(c.prior))
-		if !node.expanded {
-			break
-		}
-	}
-	if !node.expanded {
-		g.expand(node, model)
-	}
-	id := node.id
-	for len(seq) < mctsDepth {
-		outs := g.outs[id]
+// scoreContinuations stores the per-step probability of a horizon-step
+// rollout under the tempered token distribution. A missing step, including
+// every step from a node with no outgoing edge, scores as a near-zero probability.
+func (g *Graph) scoreContinuations() {
+	n := len(g.outs)
+	pi := make([][]float64, n)
+	logpi := make([][]float64, n)
+	for i, outs := range g.outs {
 		if len(outs) == 0 {
-			break
+			continue
 		}
-		e, p := sampleProb(model[contextOf(g.token[id])], outs, rng)
-		id = e.to
-		seq = append(seq, logP(p))
+		grams := temper(outs)
+		sum := 0.0
+		for _, p := range grams {
+			sum += p
+		}
+		if sum == 0 {
+			continue
+		}
+		pi[i] = grams
+		logpi[i] = make([]float64, len(grams))
+		for j, p := range grams {
+			logpi[i][j] = logP(p)
+		}
 	}
-	if len(seq) == 0 {
+	floor := logP(0)
+	V := make([]float64, n)
+	next := make([]float64, n)
+	for step := 1; step <= horizon; step++ {
+		for i, outs := range g.outs {
+			if len(outs) == 0 || pi[i] == nil {
+				next[i] = float64(step) * floor
+				continue
+			}
+			s := 0.0
+			for j, e := range outs {
+				s += pi[i][j] * (logpi[i][j] + V[e.to])
+			}
+			next[i] = s
+		}
+		V, next = next, V
+	}
+	g.cont = make([]float64, n)
+	inv := 1 / float64(horizon)
+	for i, v := range V {
+		g.cont[i] = math.Exp(v * inv)
+	}
+}
+
+// draw samples an outgoing edge. The tempered, tilted token distribution is
+// multiplied by the continuation value of the node each edge enters and by
+// the Turing machine's bias for that character.
+func (g *Graph) draw(dist map[rune]float64, cur int, m *Machine, rng *rand.Rand) edge {
+	outs := g.outs[cur]
+	weights := edgeWeights(dist, outs)
+	total := 0.0
+	for i, e := range outs {
+		weights[i] *= g.cont[e.to] * m.bias(e.ch)
+		total += weights[i]
+	}
+	if total == 0 {
+		return outs[rng.IntN(len(outs))]
+	}
+	r := rng.Float64() * total
+	acc := 0.0
+	last := outs[0]
+	for i, e := range outs {
+		if weights[i] <= 0 {
+			continue
+		}
+		last = e
+		acc += weights[i]
+		if r <= acc {
+			return e
+		}
+	}
+	return last
+}
+
+// tmKey is the finite control of one Turing transition: a state and the symbol read.
+type tmKey struct {
+	state int
+	read  rune
+}
+
+// tmStep is the write, the head move, and the next state.
+type tmStep struct {
+	write rune
+	move  int
+	next  int
+}
+
+// tape is an unbounded work tape. Cells that have never been written are blank.
+// The head may move either way without a fixed bound.
+type tape struct {
+	right []rune
+	left  []rune
+	head  int
+}
+
+const blank rune = 0
+
+func (t *tape) read() rune {
+	if t.head >= 0 {
+		if t.head >= len(t.right) {
+			return blank
+		}
+		return t.right[t.head]
+	}
+	i := -t.head - 1
+	if i >= len(t.left) {
+		return blank
+	}
+	return t.left[i]
+}
+
+func (t *tape) write(r rune) {
+	if t.head >= 0 {
+		for len(t.right) <= t.head {
+			t.right = append(t.right, blank)
+		}
+		t.right[t.head] = r
 		return
 	}
-	root.visits++
-	for i, c := range path {
-		c.visits++
-		c.value += math.Exp(meanFrom(seq, i))
-		if i+1 < len(path) {
-			c.node.visits++
+	i := -t.head - 1
+	for len(t.left) <= i {
+		t.left = append(t.left, blank)
+	}
+	t.left[i] = r
+}
+
+func (t *tape) move(d int) { t.head += d }
+
+func (t *tape) at(i int) rune {
+	h := t.head
+	t.head = i
+	r := t.read()
+	t.head = h
+	return r
+}
+
+// Machine is a Turing machine. Any machine is a finite transition table on
+// this tape, so the type is a universal interpreter. accept is the halting
+// state of a decider, or -1 when the machine does not accept.
+type Machine struct {
+	state  int
+	accept int
+	tape   tape
+	delta  map[tmKey]tmStep
+}
+
+func newMachine() *Machine {
+	return &Machine{accept: -1, delta: make(map[tmKey]tmStep)}
+}
+
+func (m *Machine) set(state int, read, write rune, move, next int) {
+	m.delta[tmKey{state, read}] = tmStep{write, move, next}
+}
+
+// step applies one transition. A missing transition halts the machine.
+func (m *Machine) step() bool {
+	s, ok := m.delta[tmKey{m.state, m.tape.read()}]
+	if !ok {
+		return false
+	}
+	m.tape.write(s.write)
+	m.tape.move(s.move)
+	m.state = s.next
+	return true
+}
+
+// run steps until the machine halts, enters its accept state, or exhausts limit.
+func (m *Machine) run(limit int) bool {
+	for range limit {
+		if m.accept >= 0 && m.state == m.accept {
+			return true
+		}
+		if !m.step() {
+			return m.accept >= 0 && m.state == m.accept
 		}
 	}
+	return false
+}
+
+// bias rescales a candidate character from the symbol under the head.
+// It is always positive, so a legal edge stays legal.
+func (m *Machine) bias(ch rune) float64 {
+	if m == nil {
+		return 1
+	}
+	s := int(m.tape.read()) + 3*m.state + int(ch)
+	if s < 0 {
+		s = -s
+	}
+	return 1 + 0.05*float64(s%7)
+}
+
+// universal23 is Wolfram's 2-state 3-symbol machine. State 0 is A and state 1
+// is B. Alex Smith proved this table universal for a repeating background on
+// the infinite tape.
+func universal23() *Machine {
+	m := newMachine()
+	// A
+	m.set(0, 0, 1, +1, 1)
+	m.set(0, 1, 2, -1, 0)
+	m.set(0, 2, 1, -1, 0)
+	// B
+	m.set(1, 0, 2, -1, 0)
+	m.set(1, 1, 2, +1, 1)
+	m.set(1, 2, 0, +1, 0)
+	return m
+}
+
+// machineFromPrompt seeds the universal machine with the prompt, one cell per
+// character, in the alphabet {0, 1, 2}. Cells outside that word stay blank.
+func machineFromPrompt(prompt []rune) *Machine {
+	m := universal23()
+	for i, r := range prompt {
+		m.tape.head = i
+		m.tape.write(r % 3)
+	}
+	m.tape.head = 0
+	m.state = 0
+	return m
 }
 
 // logP is the log of a model probability, floored so a zero stays finite.
@@ -659,60 +741,6 @@ func logP(p float64) float64 {
 		return math.Log(1e-12)
 	}
 	return math.Log(p)
-}
-
-// pick selects the child with the highest PUCT score. Ties keep the
-// earlier edge, and edges are ordered by character.
-func (n *mctsNode) pick() *mctsChild {
-	sqrtN := math.Sqrt(n.visits + 1)
-	best := 0
-	bestU := math.Inf(-1)
-	for i := range n.children {
-		c := &n.children[i]
-		q := 0.0
-		if c.visits > 0 {
-			q = c.value / c.visits
-		}
-		u := q + mctsC*c.prior*sqrtN/(1+c.visits)
-		if u > bestU {
-			best = i
-			bestU = u
-		}
-	}
-	return &n.children[best]
-}
-
-// draw samples an edge in proportion to how often search visited it.
-func (n *mctsNode) draw(rng *rand.Rand) edge {
-	total := 0.0
-	for i := range n.children {
-		total += n.children[i].visits
-	}
-	if total == 0 {
-		return n.children[rng.IntN(len(n.children))].edge
-	}
-	r := rng.Float64() * total
-	acc := 0.0
-	var last edge
-	for i := range n.children {
-		if n.children[i].visits <= 0 {
-			continue
-		}
-		last = n.children[i].edge
-		acc += n.children[i].visits
-		if r <= acc {
-			return n.children[i].edge
-		}
-	}
-	return last
-}
-
-func meanFrom(v []float64, i int) float64 {
-	sum := 0.0
-	for _, x := range v[i:] {
-		sum += x
-	}
-	return sum / float64(len(v)-i)
 }
 
 // printTop writes the highest-ranking tokens.

@@ -45,6 +45,7 @@ func TestGenerateStaysOnObservedEdges(t *testing.T) {
 	g := buildGraph(src)
 	g.rankPages(damp, 1e-14)
 	g.normalizeSuccessors()
+	g.scoreContinuations()
 
 	prompt := []rune("To be or")
 	out := g.generate(prompt, 80, 1)
@@ -246,10 +247,10 @@ func TestEdgeProbabilityUsesCountAndRank(t *testing.T) {
 	}
 }
 
-func TestMCTSLooksAhead(t *testing.T) {
-	// 'a' is the likelier next character, then the walk enters a flat node.
-	// 'b' is less likely now and certain afterwards. Visit counts should
-	// follow the whole horizon, so 'b' is searched more.
+func TestContinuationPrefersLikelyFuture(t *testing.T) {
+	// 'a' is the likelier next character and enters a flat node.
+	// 'b' is less likely now and certain afterwards. A node with no
+	// outgoing edge has nothing to roll out.
 	flat := make([]edge, 10)
 	for i := range flat {
 		flat[i] = edge{to: 1, w: 1, ch: rune('c' + i), p: 0.1}
@@ -262,42 +263,122 @@ func TestMCTSLooksAhead(t *testing.T) {
 			},
 			flat,
 			{{to: 2, w: 1, ch: 'b', p: 1}},
+			nil,
 		},
-		token: make([]token, 3),
+		token: make([]token, 4),
 	}
-	rng := rand.New(rand.NewPCG(1, 1^0x9e3779b97f4a7c15))
-	root := g.explore(nil, 0, rng)
-	var a, b float64
-	for _, c := range root.children {
-		switch c.edge.ch {
-		case 'a':
-			a = c.visits
-		case 'b':
-			b = c.visits
+	g.scoreContinuations()
+	if g.cont[2] <= g.cont[1] {
+		t.Fatalf("certain continuation %v, flat %v", g.cont[2], g.cont[1])
+	}
+	if g.cont[3] >= g.cont[2] {
+		t.Fatalf("dead-end continuation %v, certain %v", g.cont[3], g.cont[2])
+	}
+	weights := edgeWeights(nil, g.outs[0])
+	wa := weights[0] * g.cont[1]
+	wb := weights[1] * g.cont[2]
+	if wb <= wa {
+		t.Fatalf("reweighted b=%v, local favorite a=%v", wb, wa)
+	}
+}
+
+func TestDrawReturnsTheOnlyEdge(t *testing.T) {
+	g := &Graph{
+		outs:  [][]edge{{{to: 1, w: 1, ch: 'z', p: 1}}, nil},
+		token: make([]token, 2),
+	}
+	g.scoreContinuations()
+	e := g.draw(nil, 0, nil, rand.New(rand.NewPCG(3, 4)))
+	if e.ch != 'z' || e.to != 1 {
+		t.Fatalf("draw = %+v, want the only edge", e)
+	}
+}
+
+func TestUniversalMachineGrowsLeft(t *testing.T) {
+	// Blank tape, state A. The published table reaches a cell left of the
+	// origin within five steps and does not halt.
+	m := universal23()
+	for i := 0; i < 5; i++ {
+		if !m.step() {
+			t.Fatalf("halted at step %d", i)
 		}
 	}
-	if b <= a {
-		t.Fatalf("lookahead visits b=%v, local favorite a=%v", b, a)
+	if m.tape.head != 1 || m.state != 0 {
+		t.Fatalf("head %d state %d", m.tape.head, m.state)
 	}
+	if m.tape.at(-1) != 1 || m.tape.at(0) != 0 || m.tape.at(1) != 2 {
+		t.Fatalf("tape [-1]=%d [0]=%d [1]=%d", m.tape.at(-1), m.tape.at(0), m.tape.at(1))
+	}
+}
 
-	again := g.explore(nil, 0, rand.New(rand.NewPCG(1, 1^0x9e3779b97f4a7c15)))
-	for i := range root.children {
-		if again.children[i].visits != root.children[i].visits {
-			t.Fatalf("visits differ on the same seed at %q", root.children[i].edge.ch)
+func TestMachineAcceptsNonContextFree(t *testing.T) {
+	// One fixed table accepts a^n b^n c^n for every n and rejects the
+	// neighbours. A finite window cannot do that.
+	for n := 0; n <= 6; n++ {
+		m := abcMachine(strings.Repeat("a", n) + strings.Repeat("b", n) + strings.Repeat("c", n))
+		if !m.run(10000) {
+			t.Fatalf("n=%d rejected", n)
+		}
+	}
+	for _, s := range []string{"aabbc", "abbcc", "abbc", "aabc", "bac"} {
+		m := abcMachine(s)
+		if m.run(10000) {
+			t.Fatalf("%q accepted", s)
+		}
+		if m.step() {
+			t.Fatalf("%q was still running", s)
 		}
 	}
 }
 
-func TestMCTSReturnsTheOnlyEdge(t *testing.T) {
-	g := &Graph{
-		outs:  [][]edge{{{to: 1, w: 1, ch: 'z', p: 1}}},
-		token: make([]token, 2),
-		rank:  []float64{0.4, 0.6},
+func TestMachineBiasStaysPositive(t *testing.T) {
+	m := universal23()
+	before := m.bias('a')
+	if before <= 0 {
+		t.Fatalf("bias %v", before)
 	}
-	e := g.search(nil, 0, rand.New(rand.NewPCG(3, 4)))
-	if e.ch != 'z' || e.to != 1 {
-		t.Fatalf("search = %+v, want the only edge", e)
+	if !m.step() {
+		t.Fatal("halted")
 	}
+	if m.bias('a') == before {
+		t.Fatal("a step of the machine left the bias unchanged")
+	}
+}
+
+// abcMachine recognizes a^n b^n c^n. It rewrites one a, one b, and one c
+// per pass, then checks that nothing else remains.
+func abcMachine(s string) *Machine {
+	m := newMachine()
+	m.accept = 6
+	for _, r := range []rune(s) {
+		m.tape.write(r)
+		m.tape.move(1)
+	}
+	m.tape.head = 0
+	// scan
+	m.set(0, 'X', 'X', +1, 0)
+	m.set(0, 'a', 'X', +1, 1)
+	m.set(0, 'Y', 'Y', 0, 4)
+	m.set(0, blank, blank, 0, 6)
+	// seek b
+	m.set(1, 'a', 'a', +1, 1)
+	m.set(1, 'Y', 'Y', +1, 1)
+	m.set(1, 'b', 'Y', +1, 2)
+	// seek c
+	m.set(2, 'b', 'b', +1, 2)
+	m.set(2, 'Z', 'Z', +1, 2)
+	m.set(2, 'c', 'Z', -1, 3)
+	// rewind to the blank before the word, then step back onto it
+	for _, r := range []rune{'a', 'b', 'c', 'X', 'Y', 'Z'} {
+		m.set(3, r, r, -1, 3)
+	}
+	m.set(3, blank, blank, +1, 0)
+	// the a's are gone: the rest must be Y's then Z's
+	m.set(4, 'Y', 'Y', +1, 4)
+	m.set(4, 'Z', 'Z', 0, 5)
+	m.set(5, 'Z', 'Z', +1, 5)
+	m.set(5, blank, blank, 0, 6)
+	return m
 }
 
 func sumDist(dist map[rune]float64) float64 {
