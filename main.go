@@ -9,14 +9,13 @@
 // A prompt is walked as a path of overlapping 6-character nodes. At every
 // node the count-weighted PageRank of the successors is normalized into a
 // distribution over the next character and mixed, with a small weight,
-// into an order-2 model P(next | the last two characters). Value iteration
-// stores, on each node, how likely a rollout from there stays under the
-// tempered token distribution. Each new character is drawn from that
-// distribution, tilted by the order-2 conditional and multiplied by the
-// successor's continuation value and by the symbol under the head of a
-// Turing machine. The machine is Wolfram's 2-state 3-symbol machine, which
-// is universal, on a tape that grows in both directions. Each committed
-// step advances that machine and mixes the new node in.
+// into an order-2 conditional kept by a program on a Turing machine's tape.
+// The program decays that context's weights, adds the new visit, and
+// normalizes. Value iteration stores, on each node, how likely a rollout
+// from there stays under the tempered token distribution. Each new
+// character is drawn from that distribution, tilted by the table the
+// program wrote, and multiplied by the successor's continuation value.
+// Each committed step runs the program again.
 package main
 
 import (
@@ -370,27 +369,6 @@ func (g *Graph) normalizeSuccessors() {
 	}
 }
 
-// addNext mixes this node's next-character distribution into the order-2
-// context given by the token's last two characters. A new visit has weight
-// mix and the previous conditional keeps the rest. The result is normalized
-// so its entries sum to one.
-func (g *Graph) addNext(model map[context]map[rune]float64, node int) {
-	ctx := contextOf(g.token[node])
-	dist := model[ctx]
-	if dist == nil {
-		dist = make(map[rune]float64)
-		model[ctx] = dist
-	}
-	keep := 1 - mix
-	for ch := range dist {
-		dist[ch] *= keep
-	}
-	for _, e := range g.outs[node] {
-		dist[e.ch] += mix * e.p
-	}
-	normalizeDist(dist)
-}
-
 // contextOf is the order-2 state a token predicts from: its last two characters.
 func contextOf(t token) context {
 	var c context
@@ -413,23 +391,22 @@ func normalizeDist(dist map[rune]float64) {
 	}
 }
 
-// generate walks the prompt, mixing each token into the order-2 model.
-// Each character is drawn from the current token, tilted by that model and
-// multiplied by the successor's continuation value and the Turing machine's
-// head symbol. The walk then steps to that successor, advances the machine
-// one transition, and mixes the new node in.
+// generate walks the prompt and runs the tape program on each token, which
+// keeps the order-2 table. Each character is drawn from the current token,
+// tilted by that table and multiplied by the successor's continuation value.
+// The walk then steps to that successor and runs the program on the new node.
 func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 	if len(prompt) < order {
 		log.Fatalf("prompt must contain at least %d characters", order)
 	}
-	model := make(map[context]map[rune]float64)
+	m := tiltProgram()
 	cur := -1
 	for i := 0; i+order <= len(prompt); i++ {
 		node, ok := g.id[tokenFrom(prompt[i:i+order])]
 		if !ok {
 			continue
 		}
-		g.addNext(model, node)
+		m.observe(g, node)
 		cur = node
 	}
 	if cur < 0 {
@@ -437,17 +414,15 @@ func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 	}
 
 	rng := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
-	m := machineFromPrompt(prompt)
 	out := append([]rune(nil), prompt...)
 	for len(out) < len(prompt)+n {
 		if len(g.outs[cur]) == 0 {
 			break
 		}
-		e := g.draw(model[contextOf(g.token[cur])], cur, m, rng)
+		e := g.draw(m.conditional(contextOf(g.token[cur])), cur, rng)
 		out = append(out, e.ch)
 		cur = e.to
-		g.addNext(model, cur)
-		m.step()
+		m.observe(g, cur)
 	}
 	return out
 }
@@ -559,14 +534,13 @@ func (g *Graph) scoreContinuations() {
 }
 
 // draw samples an outgoing edge. The tempered, tilted token distribution is
-// multiplied by the continuation value of the node each edge enters and by
-// the Turing machine's bias for that character.
-func (g *Graph) draw(dist map[rune]float64, cur int, m *Machine, rng *rand.Rand) edge {
+// multiplied by the continuation value of the node each edge enters.
+func (g *Graph) draw(dist map[rune]float64, cur int, rng *rand.Rand) edge {
 	outs := g.outs[cur]
 	weights := edgeWeights(dist, outs)
 	total := 0.0
 	for i, e := range outs {
-		weights[i] *= g.cont[e.to] * m.bias(e.ch)
+		weights[i] *= g.cont[e.to]
 		total += weights[i]
 	}
 	if total == 0 {
@@ -650,6 +624,13 @@ func (t *tape) at(i int) rune {
 	return r
 }
 
+func (t *tape) writeAt(i int, r rune) {
+	h := t.head
+	t.head = i
+	t.write(r)
+	t.head = h
+}
+
 // Machine is a Turing machine. Any machine is a finite transition table on
 // this tape, so the type is a universal interpreter. accept is the halting
 // state of a decider, or -1 when the machine does not accept.
@@ -722,17 +703,219 @@ func universal23() *Machine {
 	return m
 }
 
-// machineFromPrompt seeds the universal machine with the prompt, one cell per
-// character, in the alphabet {0, 1, 2}. Cells outside that word stay blank.
-func machineFromPrompt(prompt []rune) *Machine {
-	m := universal23()
-	for i, r := range prompt {
-		m.tape.head = i
-		m.tape.write(r % 3)
-	}
-	m.tape.head = 0
-	m.state = 0
+// The tilt program occupies cells [0, progLen). Arguments for one visit sit
+// on the left of the origin. The order-2 table grows to the right of the program.
+const (
+	// opDecay scales the selected context's weights by 1-mix.
+	opDecay rune = 1
+	// opAdds folds the visit's successor weights into that context.
+	opAdds rune = 2
+	// opNorm makes the context's weights sum to one.
+	opNorm rune = 3
+	// opHalt stops the program.
+	opHalt rune = 4
+
+	progLen    = 4
+	tableCount = progLen
+	tableData  = progLen + 1
+
+	argC0    = -1
+	argC1    = -2
+	argN     = -3
+	argPairs = -4
+
+	// weightScale is the fixed-point unit of a weight stored on the tape.
+	weightScale int64 = 1_000_000
+)
+
+// tiltProgram writes the order-2 update on the tape and leaves the head on
+// its first instruction. The table starts empty.
+func tiltProgram() *Machine {
+	m := newMachine()
+	m.tape.writeAt(0, opDecay)
+	m.tape.writeAt(1, opAdds)
+	m.tape.writeAt(2, opNorm)
+	m.tape.writeAt(3, opHalt)
 	return m
+}
+
+// observe runs the tape program on this node's successor distribution.
+// The context is the token's last two characters.
+func (m *Machine) observe(g *Graph, node int) {
+	ctx := contextOf(g.token[node])
+	outs := g.outs[node]
+	m.tape.writeAt(argC0, ctx[0])
+	m.tape.writeAt(argC1, ctx[1])
+	m.tape.writeAt(argN, rune(len(outs)))
+	for i, e := range outs {
+		base := argPairs - 2*i
+		m.tape.writeAt(base, e.ch)
+		m.tape.writeAt(base-1, fixWeight(e.p))
+	}
+	m.runTilt()
+}
+
+// conditional reads the order-2 distribution the program stored for c.
+func (m *Machine) conditional(c context) map[rune]float64 {
+	start, nw, ok := m.findContext(c[0], c[1])
+	if !ok || nw == 0 {
+		return nil
+	}
+	dist := make(map[rune]float64, nw)
+	for i := 0; i < nw; i++ {
+		ch := m.tape.at(start + 3 + 2*i)
+		w := m.tape.at(start + 3 + 2*i + 1)
+		if w != 0 {
+			dist[ch] = float64(w) / float64(weightScale)
+		}
+	}
+	normalizeDist(dist)
+	return dist
+}
+
+// runTilt fetches each instruction of the program and stops at halt.
+func (m *Machine) runTilt() {
+	for pc := 0; ; pc++ {
+		m.tape.head = pc
+		switch m.tape.read() {
+		case opDecay:
+			m.decayContext()
+		case opAdds:
+			m.addVisit()
+		case opNorm:
+			m.normContext()
+		default:
+			return
+		}
+	}
+}
+
+func (m *Machine) decayContext() {
+	start, nw, ok := m.findContext(m.tape.at(argC0), m.tape.at(argC1))
+	if !ok {
+		return
+	}
+	keep := int64(math.Round((1 - mix) * 100))
+	for i := 0; i < nw; i++ {
+		wpos := start + 3 + 2*i + 1
+		w := mulDiv(int64(m.tape.at(wpos)), keep, 100)
+		m.tape.writeAt(wpos, rune(w))
+	}
+}
+
+func (m *Machine) addVisit() {
+	c0, c1 := m.tape.at(argC0), m.tape.at(argC1)
+	start, _, ok := m.findContext(c0, c1)
+	if !ok {
+		start = m.allocContext(c0, c1)
+	}
+	part := int64(math.Round(mix * 100))
+	n := int(m.tape.at(argN))
+	for i := 0; i < n; i++ {
+		base := argPairs - 2*i
+		ch := m.tape.at(base)
+		add := mulDiv(int64(m.tape.at(base-1)), part, 100)
+		m.addWeight(start, ch, add)
+	}
+}
+
+func (m *Machine) normContext() {
+	start, nw, ok := m.findContext(m.tape.at(argC0), m.tape.at(argC1))
+	if !ok || nw == 0 {
+		return
+	}
+	sum := int64(0)
+	for i := 0; i < nw; i++ {
+		sum += int64(m.tape.at(start + 3 + 2*i + 1))
+	}
+	if sum == 0 {
+		return
+	}
+	acc := int64(0)
+	last := -1
+	for i := 0; i < nw; i++ {
+		wpos := start + 3 + 2*i + 1
+		w := int64(m.tape.at(wpos))
+		if w > 0 {
+			last = wpos
+		}
+		next := w * weightScale / sum
+		acc += next
+		m.tape.writeAt(wpos, rune(next))
+	}
+	if last >= 0 {
+		m.tape.writeAt(last, rune(int64(m.tape.at(last))+(weightScale-acc)))
+	}
+}
+
+// findContext returns the cell where (c0, c1) is stored. The third cell of
+// a record is the number of (character, weight) pairs that follow.
+func (m *Machine) findContext(c0, c1 rune) (start, nw int, ok bool) {
+	n := int(m.tape.at(tableCount))
+	pos := tableData
+	for i := 0; i < n; i++ {
+		pairs := int(m.tape.at(pos + 2))
+		if m.tape.at(pos) == c0 && m.tape.at(pos+1) == c1 {
+			return pos, pairs, true
+		}
+		pos += 3 + 2*pairs
+	}
+	return pos, 0, false
+}
+
+func (m *Machine) allocContext(c0, c1 rune) int {
+	pos, _, ok := m.findContext(c0, c1)
+	if ok {
+		return pos
+	}
+	m.tape.writeAt(pos, c0)
+	m.tape.writeAt(pos+1, c1)
+	m.tape.writeAt(pos+2, 0)
+	m.tape.writeAt(tableCount, m.tape.at(tableCount)+1)
+	return pos
+}
+
+func (m *Machine) addWeight(start int, ch rune, add int64) {
+	nw := int(m.tape.at(start + 2))
+	for i := 0; i < nw; i++ {
+		cpos := start + 3 + 2*i
+		if m.tape.at(cpos) == ch {
+			wpos := cpos + 1
+			m.tape.writeAt(wpos, rune(int64(m.tape.at(wpos))+add))
+			return
+		}
+	}
+	at := start + 3 + 2*nw
+	m.shiftTable(at, 2)
+	m.tape.writeAt(at, ch)
+	m.tape.writeAt(at+1, rune(add))
+	m.tape.writeAt(start+2, rune(nw+1))
+}
+
+// shiftTable moves the table cells at and after from, n cells to the right.
+func (m *Machine) shiftTable(from, n int) {
+	end := tableData
+	contexts := int(m.tape.at(tableCount))
+	for i := 0; i < contexts; i++ {
+		end += 3 + 2*int(m.tape.at(end+2))
+	}
+	for i := end - 1; i >= from; i-- {
+		m.tape.writeAt(i+n, m.tape.at(i))
+	}
+}
+
+func fixWeight(p float64) rune {
+	if p <= 0 {
+		return 0
+	}
+	return rune(math.Round(p * float64(weightScale)))
+}
+
+func mulDiv(w, num, den int64) int64 {
+	if w <= 0 || num <= 0 {
+		return 0
+	}
+	return (w*num + den/2) / den
 }
 
 // logP is the log of a model probability, floored so a zero stays finite.
