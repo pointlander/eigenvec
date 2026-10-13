@@ -12,11 +12,13 @@
 // into an order-2 conditional kept by a program on a Turing machine's tape.
 // The program decays that context's weights, adds the new visit, and
 // normalizes. Each new character is chosen by Monte Carlo tree search.
-// The tempered token distribution, tilted by the table the program wrote,
-// is the prior. A rollout scores a path by the geometric mean of those
-// probabilities, and the character is drawn from the visit counts. Each
-// committed step runs the program on the node that was chosen. A rollout
-// only reads the table.
+// The tempered token distribution, tilted by that table, is rescaled by
+// the symbol under the head of Wolfram's 2-state 3-symbol machine. That
+// machine is universal, and its tape grows in both directions. A rollout
+// scores a path by the geometric mean of those probabilities, and the
+// character is drawn from the visit counts. Each committed step runs the
+// table program and advances the universal machine one transition.
+// A rollout only reads both.
 package main
 
 import (
@@ -395,20 +397,22 @@ func normalizeDist(dist map[rune]float64) {
 
 // generate walks the prompt and runs the tape program on each token, which
 // keeps the order-2 table. Each character is chosen by Monte Carlo tree
-// search from the current token. The walk then steps to that successor and
-// runs the program on the new node.
+// search from the current token, rescaled by the universal machine. The
+// walk then steps to that successor, runs the program on the new node, and
+// advances the universal machine one transition.
 func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 	if len(prompt) < order {
 		log.Fatalf("prompt must contain at least %d characters", order)
 	}
-	m := tiltProgram()
+	table := tiltProgram()
+	cpu := machineFromPrompt(prompt)
 	cur := -1
 	for i := 0; i+order <= len(prompt); i++ {
 		node, ok := g.id[tokenFrom(prompt[i:i+order])]
 		if !ok {
 			continue
 		}
-		m.observe(g, node)
+		table.observe(g, node)
 		cur = node
 	}
 	if cur < 0 {
@@ -421,10 +425,11 @@ func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 		if len(g.outs[cur]) == 0 {
 			break
 		}
-		e := g.search(m, cur, rng)
+		e := g.search(table, cpu, cur, rng)
 		out = append(out, e.ch)
 		cur = e.to
-		m.observe(g, cur)
+		table.observe(g, cur)
+		cpu.step()
 	}
 	return out
 }
@@ -486,12 +491,14 @@ func temper(outs []edge) []float64 {
 	return grams
 }
 
-// sampleProb draws a successor and returns its share of the tilted distribution.
-func sampleProb(dist map[rune]float64, outs []edge, rng *rand.Rand) (edge, float64) {
+// sampleProb draws a successor and returns its share of the tilted distribution
+// after the universal machine rescales it.
+func sampleProb(dist map[rune]float64, outs []edge, cpu *Machine, rng *rand.Rand) (edge, float64) {
 	weights := edgeWeights(dist, outs)
 	total := 0.0
-	for _, w := range weights {
-		total += w
+	for i, e := range outs {
+		weights[i] *= cpu.bias(e.ch)
+		total += weights[i]
 	}
 	if total == 0 {
 		i := rng.IntN(len(outs))
@@ -537,16 +544,16 @@ type mctsNode struct {
 
 // search chooses the next edge by Monte Carlo tree search and draws it
 // from the root visit counts. A node with one continuation is returned as it is.
-func (g *Graph) search(m *Machine, cur int, rng *rand.Rand) edge {
-	root := g.explore(m, cur, rng)
+func (g *Graph) search(table, cpu *Machine, cur int, rng *rand.Rand) edge {
+	root := g.explore(table, cpu, cur, rng)
 	return root.draw(rng)
 }
 
 // explore runs the simulations from cur and returns the search root.
-// The tape is only read. Rollouts do not run the tilt program.
-func (g *Graph) explore(m *Machine, cur int, rng *rand.Rand) *mctsNode {
+// The order-2 table and the universal machine are only read.
+func (g *Graph) explore(table, cpu *Machine, cur int, rng *rand.Rand) *mctsNode {
 	root := &mctsNode{id: cur}
-	g.expand(root, m)
+	g.expand(root, table, cpu)
 	if len(root.children) <= 1 {
 		for i := range root.children {
 			root.children[i].visits = 1
@@ -554,14 +561,14 @@ func (g *Graph) explore(m *Machine, cur int, rng *rand.Rand) *mctsNode {
 		return root
 	}
 	for range mctsSims {
-		g.playout(root, m, rng)
+		g.playout(root, table, cpu, rng)
 	}
 	return root
 }
 
 // expand attaches one child per outgoing edge. The prior is the tilted
-// distribution at this node.
-func (g *Graph) expand(n *mctsNode, m *Machine) {
+// distribution at this node, rescaled by the universal machine.
+func (g *Graph) expand(n *mctsNode, table, cpu *Machine) {
 	if n.expanded {
 		return
 	}
@@ -570,10 +577,11 @@ func (g *Graph) expand(n *mctsNode, m *Machine) {
 	if len(outs) == 0 {
 		return
 	}
-	weights := edgeWeights(g.distAt(m, n.id), outs)
+	weights := edgeWeights(g.distAt(table, n.id), outs)
 	sum := 0.0
-	for _, w := range weights {
-		sum += w
+	for i, e := range outs {
+		weights[i] *= cpu.bias(e.ch)
+		sum += weights[i]
 	}
 	n.children = make([]mctsChild, len(outs))
 	for i, e := range outs {
@@ -587,7 +595,7 @@ func (g *Graph) expand(n *mctsNode, m *Machine) {
 
 // playout walks the tree by PUCT, rolls out the rest of the horizon, and
 // backs up the geometric mean of the model probabilities along each suffix.
-func (g *Graph) playout(root *mctsNode, m *Machine, rng *rand.Rand) {
+func (g *Graph) playout(root *mctsNode, table, cpu *Machine, rng *rand.Rand) {
 	node := root
 	path := make([]*mctsChild, 0, mctsDepth)
 	seq := make([]float64, 0, mctsDepth)
@@ -604,7 +612,7 @@ func (g *Graph) playout(root *mctsNode, m *Machine, rng *rand.Rand) {
 		}
 	}
 	if !node.expanded {
-		g.expand(node, m)
+		g.expand(node, table, cpu)
 	}
 	id := node.id
 	for len(seq) < mctsDepth {
@@ -612,7 +620,7 @@ func (g *Graph) playout(root *mctsNode, m *Machine, rng *rand.Rand) {
 		if len(outs) == 0 {
 			break
 		}
-		e, p := sampleProb(g.distAt(m, id), outs, rng)
+		e, p := sampleProb(g.distAt(table, id), outs, cpu, rng)
 		id = e.to
 		seq = append(seq, logP(p))
 	}
@@ -631,11 +639,11 @@ func (g *Graph) playout(root *mctsNode, m *Machine, rng *rand.Rand) {
 
 // distAt reads the order-2 table for this node. A nil machine leaves the
 // token distribution untilted.
-func (g *Graph) distAt(m *Machine, id int) map[rune]float64 {
-	if m == nil || id < 0 || id >= len(g.token) {
+func (g *Graph) distAt(table *Machine, id int) map[rune]float64 {
+	if table == nil || id < 0 || id >= len(g.token) {
 		return nil
 	}
-	return m.conditional(contextOf(g.token[id]))
+	return table.conditional(contextOf(g.token[id]))
 }
 
 // pick selects the child with the highest PUCT score. Ties keep the
@@ -830,6 +838,19 @@ func universal23() *Machine {
 	m.set(1, 0, 2, -1, 0)
 	m.set(1, 1, 2, +1, 1)
 	m.set(1, 2, 0, +1, 0)
+	return m
+}
+
+// machineFromPrompt seeds the universal machine with the prompt, one cell per
+// character, in the alphabet {0, 1, 2}. Cells outside that word stay blank.
+func machineFromPrompt(prompt []rune) *Machine {
+	m := universal23()
+	for i, r := range prompt {
+		m.tape.head = i
+		m.tape.write(r % 3)
+	}
+	m.tape.head = 0
+	m.state = 0
 	return m
 }
 

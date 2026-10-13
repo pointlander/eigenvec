@@ -273,7 +273,7 @@ func TestMCTSLooksAhead(t *testing.T) {
 		token: make([]token, 3),
 	}
 	rng := rand.New(rand.NewPCG(1, 1^0x9e3779b97f4a7c15))
-	root := g.explore(nil, 0, rng)
+	root := g.explore(nil, nil, 0, rng)
 	var a, b float64
 	for _, c := range root.children {
 		switch c.edge.ch {
@@ -286,7 +286,7 @@ func TestMCTSLooksAhead(t *testing.T) {
 	if b <= a {
 		t.Fatalf("lookahead visits b=%v, local favorite a=%v", b, a)
 	}
-	again := g.explore(nil, 0, rand.New(rand.NewPCG(1, 1^0x9e3779b97f4a7c15)))
+	again := g.explore(nil, nil, 0, rand.New(rand.NewPCG(1, 1^0x9e3779b97f4a7c15)))
 	for i := range root.children {
 		if again.children[i].visits != root.children[i].visits {
 			t.Fatalf("visits differ on the same seed at %q", root.children[i].edge.ch)
@@ -299,7 +299,7 @@ func TestMCTSReturnsTheOnlyEdge(t *testing.T) {
 		outs:  [][]edge{{{to: 1, w: 1, ch: 'z', p: 1}}, nil},
 		token: make([]token, 2),
 	}
-	e := g.search(nil, 0, rand.New(rand.NewPCG(3, 4)))
+	e := g.search(nil, nil, 0, rand.New(rand.NewPCG(3, 4)))
 	if e.ch != 'z' || e.to != 1 {
 		t.Fatalf("search = %+v, want the only edge", e)
 	}
@@ -338,6 +338,32 @@ func TestMachineAcceptsNonContextFree(t *testing.T) {
 		}
 		if m.step() {
 			t.Fatalf("%q was still running", s)
+		}
+	}
+}
+
+func TestUniversalMachineRescalesPrior(t *testing.T) {
+	g := &Graph{
+		outs: [][]edge{{
+			{to: 1, w: 1, ch: 'a', p: 0.5},
+			{to: 1, w: 1, ch: 'b', p: 0.5},
+		}},
+		token: make([]token, 2),
+	}
+	cpu := universal23()
+	before := &mctsNode{id: 0}
+	g.expand(before, nil, cpu)
+	if !cpu.step() {
+		t.Fatal("universal machine halted")
+	}
+	after := &mctsNode{id: 0}
+	g.expand(after, nil, cpu)
+	if before.children[0].prior == after.children[0].prior {
+		t.Fatal("a step of the machine left the prior unchanged")
+	}
+	for _, c := range after.children {
+		if c.prior <= 0 {
+			t.Fatalf("prior lost %q", c.edge.ch)
 		}
 	}
 }
