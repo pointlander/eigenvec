@@ -8,19 +8,15 @@
 //
 // A prompt is walked as a path of overlapping 6-character nodes. At every
 // node the count-weighted PageRank of the successors is normalized into a
-// distribution over the next character and mixed, with a small weight,
-// into an order-2 conditional kept by a program on a Turing machine's tape.
-// The program decays that context's weights, adds the new visit, and
-// normalizes. Each new character is chosen by Monte Carlo tree search.
-// The tempered token distribution, tilted by that table, is rescaled by
-// the symbol under the head of Wolfram's 2-state 3-symbol machine.
+// distribution over the next character. An order-2 network embeds the last
+// two characters into 256 inputs and predicts the next character with 256
+// outputs. One gradient step per committed visit trains it on that node's
+// successor distribution. Each new character is chosen by Monte Carlo tree
+// search. The tempered token distribution is tilted by the network.
 // Closing a frequent word such as "the" is discounted by how often the
-// corpus uses it. The machine is universal, and its tape grows in both
-// directions. A rollout
-// scores a path by the geometric mean of those probabilities, and the
-// character is drawn from the visit counts. Each committed step runs the
-// table program and advances the universal machine one transition.
-// A rollout only reads both.
+// corpus uses it. A rollout scores a path by the geometric mean of those
+// probabilities, and the character is drawn from the visit counts. A
+// rollout only reads the network.
 package main
 
 import (
@@ -50,12 +46,13 @@ const (
 	maxRankIter = 10000
 	// order is the number of characters in a Markov token.
 	order = 6
-	// sumOrder is the order of the summed next-character model.
+	// sumOrder is the order of the next-character network.
 	sumOrder = 2
-	// mix is the weight of a new visit in an order-2 conditional.
-	// The previous conditional keeps the rest.
-	mix = 0.15
-	// tilt is the share of a draw taken from the order-2 conditional.
+	// learnRate is the step size of one realtime update of the network.
+	learnRate = 0.1
+	// vocab is the number of inputs and outputs. Predictions are over bytes.
+	vocab = 256
+	// tilt is the share of a draw taken from the order-2 network.
 	// The rest follows the current token.
 	tilt = 0.15
 	// temp softens the token distribution. 1 leaves it unchanged.
@@ -71,7 +68,7 @@ const (
 	freq = 0.5
 )
 
-// context is the order-2 state the summed distribution conditions on.
+// context is the order-2 state the network conditions on.
 type context [sumOrder]rune
 
 // token is an order-6 Markov state: six successive characters.
@@ -525,39 +522,22 @@ func contextOf(t token) context {
 	return c
 }
 
-// normalizeDist scales dist so its entries sum to one.
-func normalizeDist(dist map[rune]float64) {
-	sum := 0.0
-	for _, p := range dist {
-		sum += p
-	}
-	if sum == 0 {
-		return
-	}
-	inv := 1 / sum
-	for ch := range dist {
-		dist[ch] *= inv
-	}
-}
-
-// generate walks the prompt and runs the tape program on each token, which
-// keeps the order-2 table. Each character is chosen by Monte Carlo tree
-// search from the current token, rescaled by the universal machine. The
-// walk then steps to that successor, runs the program on the new node, and
-// advances the universal machine one transition.
+// generate walks the prompt and trains the order-2 network on each token.
+// Each character is chosen by Monte Carlo tree search from the current
+// token, tilted by the network. The walk then steps to that successor and
+// trains on the new node. A rollout only reads the network.
 func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 	if len(prompt) < order {
 		log.Fatalf("prompt must contain at least %d characters", order)
 	}
-	table := tiltProgram()
-	cpu := machineFromPrompt(prompt)
+	net := newNet(seed)
 	cur := -1
 	for i := 0; i+order <= len(prompt); i++ {
 		node, ok := g.id[tokenFrom(prompt[i:i+order])]
 		if !ok {
 			continue
 		}
-		table.observe(g, node)
+		g.learnNode(net, node)
 		cur = node
 	}
 	if cur < 0 {
@@ -570,11 +550,10 @@ func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 		if len(g.outs[cur]) == 0 {
 			break
 		}
-		e := g.search(table, cpu, cur, rng)
+		e := g.search(net, cur, rng)
 		out = append(out, e.ch)
 		cur = e.to
-		table.observe(g, cur)
-		cpu.step()
+		g.learnNode(net, cur)
 	}
 	return out
 }
@@ -636,27 +615,23 @@ func temper(outs []edge) []float64 {
 	return grams
 }
 
-// priorWeights is the tempered, tilted distribution, rescaled by the
-// universal machine and by the penalty for closing a frequent word.
-func (g *Graph) priorWeights(dist map[rune]float64, id int, outs []edge, cpu *Machine) []float64 {
+// priorWeights is the tempered token distribution, tilted by the network
+// and discounted when a frequent word closes.
+func (g *Graph) priorWeights(dist map[rune]float64, id int, outs []edge) []float64 {
 	weights := edgeWeights(dist, outs)
-	var tok token
-	have := id >= 0 && id < len(g.token)
-	if have {
-		tok = g.token[id]
+	if id < 0 || id >= len(g.token) {
+		return weights
 	}
+	tok := g.token[id]
 	for i, e := range outs {
-		weights[i] *= cpu.bias(e.ch)
-		if have {
-			weights[i] *= g.closePenalty(tok, e.ch)
-		}
+		weights[i] *= g.closePenalty(tok, e.ch)
 	}
 	return weights
 }
 
 // sampleProb draws a successor and returns its share of priorWeights.
-func (g *Graph) sampleProb(dist map[rune]float64, id int, outs []edge, cpu *Machine, rng *rand.Rand) (edge, float64) {
-	weights := g.priorWeights(dist, id, outs, cpu)
+func (g *Graph) sampleProb(dist map[rune]float64, id int, outs []edge, rng *rand.Rand) (edge, float64) {
+	weights := g.priorWeights(dist, id, outs)
 	total := 0.0
 	for _, w := range weights {
 		total += w
@@ -705,16 +680,20 @@ type mctsNode struct {
 
 // search chooses the next edge by Monte Carlo tree search and draws it
 // from the root visit counts. A node with one continuation is returned as it is.
-func (g *Graph) search(table, cpu *Machine, cur int, rng *rand.Rand) edge {
-	root := g.explore(table, cpu, cur, rng)
+// Predictions made during the search are cached. The network is only read.
+func (g *Graph) search(net *Net, cur int, rng *rand.Rand) edge {
+	if net != nil {
+		net.cache = make(map[[2]byte][vocab]float64)
+	}
+	root := g.explore(net, cur, rng)
 	return root.draw(rng)
 }
 
 // explore runs the simulations from cur and returns the search root.
-// The order-2 table and the universal machine are only read.
-func (g *Graph) explore(table, cpu *Machine, cur int, rng *rand.Rand) *mctsNode {
+// The network is only read.
+func (g *Graph) explore(net *Net, cur int, rng *rand.Rand) *mctsNode {
 	root := &mctsNode{id: cur}
-	g.expand(root, table, cpu)
+	g.expand(root, net)
 	if len(root.children) <= 1 {
 		for i := range root.children {
 			root.children[i].visits = 1
@@ -722,14 +701,14 @@ func (g *Graph) explore(table, cpu *Machine, cur int, rng *rand.Rand) *mctsNode 
 		return root
 	}
 	for range mctsSims {
-		g.playout(root, table, cpu, rng)
+		g.playout(root, net, rng)
 	}
 	return root
 }
 
 // expand attaches one child per outgoing edge. The prior is the tilted
-// distribution at this node, rescaled by the universal machine.
-func (g *Graph) expand(n *mctsNode, table, cpu *Machine) {
+// distribution at this node.
+func (g *Graph) expand(n *mctsNode, net *Net) {
 	if n.expanded {
 		return
 	}
@@ -738,7 +717,7 @@ func (g *Graph) expand(n *mctsNode, table, cpu *Machine) {
 	if len(outs) == 0 {
 		return
 	}
-	weights := g.priorWeights(g.distAt(table, n.id), n.id, outs, cpu)
+	weights := g.priorWeights(g.distAt(net, n.id), n.id, outs)
 	sum := 0.0
 	for _, w := range weights {
 		sum += w
@@ -755,7 +734,7 @@ func (g *Graph) expand(n *mctsNode, table, cpu *Machine) {
 
 // playout walks the tree by PUCT, rolls out the rest of the horizon, and
 // backs up the geometric mean of the model probabilities along each suffix.
-func (g *Graph) playout(root *mctsNode, table, cpu *Machine, rng *rand.Rand) {
+func (g *Graph) playout(root *mctsNode, net *Net, rng *rand.Rand) {
 	node := root
 	path := make([]*mctsChild, 0, mctsDepth)
 	seq := make([]float64, 0, mctsDepth)
@@ -772,7 +751,7 @@ func (g *Graph) playout(root *mctsNode, table, cpu *Machine, rng *rand.Rand) {
 		}
 	}
 	if !node.expanded {
-		g.expand(node, table, cpu)
+		g.expand(node, net)
 	}
 	id := node.id
 	for len(seq) < mctsDepth {
@@ -780,7 +759,7 @@ func (g *Graph) playout(root *mctsNode, table, cpu *Machine, rng *rand.Rand) {
 		if len(outs) == 0 {
 			break
 		}
-		e, p := g.sampleProb(g.distAt(table, id), id, outs, cpu, rng)
+		e, p := g.sampleProb(g.distAt(net, id), id, outs, rng)
 		id = e.to
 		seq = append(seq, logP(p))
 	}
@@ -797,13 +776,20 @@ func (g *Graph) playout(root *mctsNode, table, cpu *Machine, rng *rand.Rand) {
 	}
 }
 
-// distAt reads the order-2 table for this node. A nil machine leaves the
-// token distribution untilted.
-func (g *Graph) distAt(table *Machine, id int) map[rune]float64 {
-	if table == nil || id < 0 || id >= len(g.token) {
+// distAt is the network's prediction on this node's outgoing edges.
+// A nil network leaves the token distribution untilted.
+func (g *Graph) distAt(net *Net, id int) map[rune]float64 {
+	if net == nil || id < 0 || id >= len(g.token) || id >= len(g.outs) {
 		return nil
 	}
-	return table.conditional(contextOf(g.token[id]))
+	ctx := contextOf(g.token[id])
+	sm := net.predict(byteOf(ctx[0]), byteOf(ctx[1]))
+	outs := g.outs[id]
+	dist := make(map[rune]float64, len(outs))
+	for _, e := range outs {
+		dist[e.ch] = sm[byteOf(e.ch)]
+	}
+	return dist
 }
 
 // pick selects the child with the highest PUCT score. Ties keep the
@@ -860,373 +846,181 @@ func meanFrom(v []float64, i int) float64 {
 	return sum / float64(len(v)-i)
 }
 
-// tmKey is the finite control of one Turing transition: a state and the symbol read.
-type tmKey struct {
-	state int
-	read  rune
+// Net predicts the next byte from the last two bytes.
+// e0 and e1 embed the older and the newer character into 256 inputs.
+// w maps those inputs to 256 logits.
+type Net struct {
+	e0, e1 [vocab][vocab]float64
+	w      [vocab][vocab]float64
+	b      [vocab]float64
+	// cache holds predictions while the weights stay fixed.
+	cache map[[2]byte][vocab]float64
 }
 
-// tmStep is the write, the head move, and the next state.
-type tmStep struct {
-	write rune
-	move  int
-	next  int
-}
-
-// tape is an unbounded work tape. Cells that have never been written are blank.
-// The head may move either way without a fixed bound.
-type tape struct {
-	right []rune
-	left  []rune
-	head  int
-}
-
-const blank rune = 0
-
-func (t *tape) read() rune {
-	if t.head >= 0 {
-		if t.head >= len(t.right) {
-			return blank
+// newNet draws a small deterministic initialization from seed.
+// Zero weights would leave the gradient at zero.
+func newNet(seed uint64) *Net {
+	n := &Net{}
+	rng := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
+	scale := 1 / math.Sqrt(float64(vocab))
+	for i := range n.e0 {
+		for j := range n.e0[i] {
+			n.e0[i][j] = (rng.Float64()*2 - 1) * scale
+			n.e1[i][j] = (rng.Float64()*2 - 1) * scale
+			n.w[i][j] = (rng.Float64()*2 - 1) * scale
 		}
-		return t.right[t.head]
 	}
-	i := -t.head - 1
-	if i >= len(t.left) {
-		return blank
-	}
-	return t.left[i]
+	return n
 }
 
-func (t *tape) write(r rune) {
-	if t.head >= 0 {
-		for len(t.right) <= t.head {
-			t.right = append(t.right, blank)
+// byteOf is the low 8 bits of a character. A rune above 255 shares its
+// prediction with that byte.
+func byteOf(r rune) byte { return byte(r) }
+
+// hidden is tanh of the summed embeddings, the 256 inputs for this context.
+func (n *Net) hidden(c0, c1 byte) [vocab]float64 {
+	var h [vocab]float64
+	e0 := &n.e0[c0]
+	e1 := &n.e1[c1]
+	for i := range h {
+		h[i] = math.Tanh(e0[i] + e1[i])
+	}
+	return h
+}
+
+// probs is the softmax of the 256 logits for this hidden state.
+func (n *Net) probs(h *[vocab]float64) [vocab]float64 {
+	var logit [vocab]float64
+	maxL := math.Inf(-1)
+	for o := range logit {
+		s := n.b[o]
+		row := &n.w[o]
+		for i := range row {
+			s += row[i] * h[i]
 		}
-		t.right[t.head] = r
+		logit[o] = s
+		if s > maxL {
+			maxL = s
+		}
+	}
+	var p [vocab]float64
+	sum := 0.0
+	for o := range p {
+		p[o] = math.Exp(logit[o] - maxL)
+		sum += p[o]
+	}
+	inv := 1 / sum
+	for o := range p {
+		p[o] *= inv
+	}
+	return p
+}
+
+// predict is the distribution over the next byte. A cache hit is returned
+// while the weights are frozen.
+func (n *Net) predict(c0, c1 byte) [vocab]float64 {
+	key := [2]byte{c0, c1}
+	if n.cache != nil {
+		if p, ok := n.cache[key]; ok {
+			return p
+		}
+	}
+	h := n.hidden(c0, c1)
+	p := n.probs(&h)
+	if n.cache != nil {
+		n.cache[key] = p
+	}
+	return p
+}
+
+// learn takes one cross-entropy step so this context moves toward target.
+// target is a distribution over bytes. The prediction cache is dropped.
+func (n *Net) learn(c0, c1 rune, target *[vocab]float64) {
+	n.cache = nil
+	a, b := byteOf(c0), byteOf(c1)
+	h := n.hidden(a, b)
+	p := n.probs(&h)
+	var dlogit [vocab]float64
+	for o := range dlogit {
+		dlogit[o] = p[o] - target[o]
+	}
+	// dh uses the weights from before they change.
+	var dh [vocab]float64
+	for o := range dlogit {
+		d := dlogit[o]
+		if d == 0 {
+			continue
+		}
+		row := &n.w[o]
+		for i := range dh {
+			dh[i] += d * row[i]
+		}
+	}
+	for i := range dh {
+		dh[i] *= 1 - h[i]*h[i]
+	}
+	for o := range dlogit {
+		d := dlogit[o]
+		if d == 0 {
+			continue
+		}
+		n.b[o] -= learnRate * d
+		row := &n.w[o]
+		step := learnRate * d
+		for i := range row {
+			row[i] -= step * h[i]
+		}
+	}
+	e0 := &n.e0[a]
+	e1 := &n.e1[b]
+	for i := range dh {
+		step := learnRate * dh[i]
+		e0[i] -= step
+		e1[i] -= step
+	}
+}
+
+// byteTarget is this node's successor distribution, summed on the byte
+// each character truncates to.
+func (g *Graph) byteTarget(id int) [vocab]float64 {
+	var t [vocab]float64
+	if id < 0 || id >= len(g.outs) {
+		return t
+	}
+	sum := 0.0
+	for _, e := range g.outs[id] {
+		if e.p <= 0 {
+			continue
+		}
+		t[byteOf(e.ch)] += e.p
+		sum += e.p
+	}
+	if sum == 0 || math.Abs(sum-1) <= 1e-12 {
+		return t
+	}
+	inv := 1 / sum
+	for i := range t {
+		t[i] *= inv
+	}
+	return t
+}
+
+// learnNode trains the network on this node's successor distribution.
+// A node with no successor mass is left alone.
+func (g *Graph) learnNode(net *Net, id int) {
+	if net == nil || id < 0 || id >= len(g.token) || id >= len(g.outs) {
 		return
 	}
-	i := -t.head - 1
-	for len(t.left) <= i {
-		t.left = append(t.left, blank)
-	}
-	t.left[i] = r
-}
-
-func (t *tape) move(d int) { t.head += d }
-
-func (t *tape) at(i int) rune {
-	h := t.head
-	t.head = i
-	r := t.read()
-	t.head = h
-	return r
-}
-
-func (t *tape) writeAt(i int, r rune) {
-	h := t.head
-	t.head = i
-	t.write(r)
-	t.head = h
-}
-
-// Machine is a Turing machine. Any machine is a finite transition table on
-// this tape, so the type is a universal interpreter. accept is the halting
-// state of a decider, or -1 when the machine does not accept.
-type Machine struct {
-	state  int
-	accept int
-	tape   tape
-	delta  map[tmKey]tmStep
-}
-
-func newMachine() *Machine {
-	return &Machine{accept: -1, delta: make(map[tmKey]tmStep)}
-}
-
-func (m *Machine) set(state int, read, write rune, move, next int) {
-	m.delta[tmKey{state, read}] = tmStep{write, move, next}
-}
-
-// step applies one transition. A missing transition halts the machine.
-func (m *Machine) step() bool {
-	s, ok := m.delta[tmKey{m.state, m.tape.read()}]
-	if !ok {
-		return false
-	}
-	m.tape.write(s.write)
-	m.tape.move(s.move)
-	m.state = s.next
-	return true
-}
-
-// run steps until the machine halts, enters its accept state, or exhausts limit.
-func (m *Machine) run(limit int) bool {
-	for range limit {
-		if m.accept >= 0 && m.state == m.accept {
-			return true
-		}
-		if !m.step() {
-			return m.accept >= 0 && m.state == m.accept
-		}
-	}
-	return false
-}
-
-// bias rescales a candidate character from the symbol under the head.
-// It is always positive, so a legal edge stays legal.
-func (m *Machine) bias(ch rune) float64 {
-	if m == nil {
-		return 1
-	}
-	s := int(m.tape.read()) + 3*m.state + int(ch)
-	if s < 0 {
-		s = -s
-	}
-	return 1 + 0.05*float64(s%7)
-}
-
-// universal23 is Wolfram's 2-state 3-symbol machine. State 0 is A and state 1
-// is B. Alex Smith proved this table universal for a repeating background on
-// the infinite tape.
-func universal23() *Machine {
-	m := newMachine()
-	// A
-	m.set(0, 0, 1, +1, 1)
-	m.set(0, 1, 2, -1, 0)
-	m.set(0, 2, 1, -1, 0)
-	// B
-	m.set(1, 0, 2, -1, 0)
-	m.set(1, 1, 2, +1, 1)
-	m.set(1, 2, 0, +1, 0)
-	return m
-}
-
-// machineFromPrompt seeds the universal machine with the prompt, one cell per
-// character, in the alphabet {0, 1, 2}. Cells outside that word stay blank.
-func machineFromPrompt(prompt []rune) *Machine {
-	m := universal23()
-	for i, r := range prompt {
-		m.tape.head = i
-		m.tape.write(r % 3)
-	}
-	m.tape.head = 0
-	m.state = 0
-	return m
-}
-
-// The tilt program occupies cells [0, progLen). Arguments for one visit sit
-// on the left of the origin. The order-2 table grows to the right of the program.
-const (
-	// opDecay scales the selected context's weights by 1-mix.
-	opDecay rune = 1
-	// opAdds folds the visit's successor weights into that context.
-	opAdds rune = 2
-	// opNorm makes the context's weights sum to one.
-	opNorm rune = 3
-	// opHalt stops the program.
-	opHalt rune = 4
-
-	progLen    = 4
-	tableCount = progLen
-	tableData  = progLen + 1
-
-	argC0    = -1
-	argC1    = -2
-	argN     = -3
-	argPairs = -4
-
-	// weightScale is the fixed-point unit of a weight stored on the tape.
-	weightScale int64 = 1_000_000
-)
-
-// tiltProgram writes the order-2 update on the tape and leaves the head on
-// its first instruction. The table starts empty.
-func tiltProgram() *Machine {
-	m := newMachine()
-	m.tape.writeAt(0, opDecay)
-	m.tape.writeAt(1, opAdds)
-	m.tape.writeAt(2, opNorm)
-	m.tape.writeAt(3, opHalt)
-	return m
-}
-
-// observe runs the tape program on this node's successor distribution.
-// The context is the token's last two characters.
-func (m *Machine) observe(g *Graph, node int) {
-	ctx := contextOf(g.token[node])
-	outs := g.outs[node]
-	m.tape.writeAt(argC0, ctx[0])
-	m.tape.writeAt(argC1, ctx[1])
-	m.tape.writeAt(argN, rune(len(outs)))
-	for i, e := range outs {
-		base := argPairs - 2*i
-		m.tape.writeAt(base, e.ch)
-		m.tape.writeAt(base-1, fixWeight(e.p))
-	}
-	m.runTilt()
-}
-
-// conditional reads the order-2 distribution the program stored for c.
-func (m *Machine) conditional(c context) map[rune]float64 {
-	start, nw, ok := m.findContext(c[0], c[1])
-	if !ok || nw == 0 {
-		return nil
-	}
-	dist := make(map[rune]float64, nw)
-	for i := 0; i < nw; i++ {
-		ch := m.tape.at(start + 3 + 2*i)
-		w := m.tape.at(start + 3 + 2*i + 1)
-		if w != 0 {
-			dist[ch] = float64(w) / float64(weightScale)
-		}
-	}
-	normalizeDist(dist)
-	return dist
-}
-
-// runTilt fetches each instruction of the program and stops at halt.
-func (m *Machine) runTilt() {
-	for pc := 0; ; pc++ {
-		m.tape.head = pc
-		switch m.tape.read() {
-		case opDecay:
-			m.decayContext()
-		case opAdds:
-			m.addVisit()
-		case opNorm:
-			m.normContext()
-		default:
-			return
-		}
-	}
-}
-
-func (m *Machine) decayContext() {
-	start, nw, ok := m.findContext(m.tape.at(argC0), m.tape.at(argC1))
-	if !ok {
-		return
-	}
-	keep := int64(math.Round((1 - mix) * 100))
-	for i := 0; i < nw; i++ {
-		wpos := start + 3 + 2*i + 1
-		w := mulDiv(int64(m.tape.at(wpos)), keep, 100)
-		m.tape.writeAt(wpos, rune(w))
-	}
-}
-
-func (m *Machine) addVisit() {
-	c0, c1 := m.tape.at(argC0), m.tape.at(argC1)
-	start, _, ok := m.findContext(c0, c1)
-	if !ok {
-		start = m.allocContext(c0, c1)
-	}
-	part := int64(math.Round(mix * 100))
-	n := int(m.tape.at(argN))
-	for i := 0; i < n; i++ {
-		base := argPairs - 2*i
-		ch := m.tape.at(base)
-		add := mulDiv(int64(m.tape.at(base-1)), part, 100)
-		m.addWeight(start, ch, add)
-	}
-}
-
-func (m *Machine) normContext() {
-	start, nw, ok := m.findContext(m.tape.at(argC0), m.tape.at(argC1))
-	if !ok || nw == 0 {
-		return
-	}
-	sum := int64(0)
-	for i := 0; i < nw; i++ {
-		sum += int64(m.tape.at(start + 3 + 2*i + 1))
+	target := g.byteTarget(id)
+	sum := 0.0
+	for _, p := range target {
+		sum += p
 	}
 	if sum == 0 {
 		return
 	}
-	acc := int64(0)
-	last := -1
-	for i := 0; i < nw; i++ {
-		wpos := start + 3 + 2*i + 1
-		w := int64(m.tape.at(wpos))
-		if w > 0 {
-			last = wpos
-		}
-		next := w * weightScale / sum
-		acc += next
-		m.tape.writeAt(wpos, rune(next))
-	}
-	if last >= 0 {
-		m.tape.writeAt(last, rune(int64(m.tape.at(last))+(weightScale-acc)))
-	}
-}
-
-// findContext returns the cell where (c0, c1) is stored. The third cell of
-// a record is the number of (character, weight) pairs that follow.
-func (m *Machine) findContext(c0, c1 rune) (start, nw int, ok bool) {
-	n := int(m.tape.at(tableCount))
-	pos := tableData
-	for i := 0; i < n; i++ {
-		pairs := int(m.tape.at(pos + 2))
-		if m.tape.at(pos) == c0 && m.tape.at(pos+1) == c1 {
-			return pos, pairs, true
-		}
-		pos += 3 + 2*pairs
-	}
-	return pos, 0, false
-}
-
-func (m *Machine) allocContext(c0, c1 rune) int {
-	pos, _, ok := m.findContext(c0, c1)
-	if ok {
-		return pos
-	}
-	m.tape.writeAt(pos, c0)
-	m.tape.writeAt(pos+1, c1)
-	m.tape.writeAt(pos+2, 0)
-	m.tape.writeAt(tableCount, m.tape.at(tableCount)+1)
-	return pos
-}
-
-func (m *Machine) addWeight(start int, ch rune, add int64) {
-	nw := int(m.tape.at(start + 2))
-	for i := 0; i < nw; i++ {
-		cpos := start + 3 + 2*i
-		if m.tape.at(cpos) == ch {
-			wpos := cpos + 1
-			m.tape.writeAt(wpos, rune(int64(m.tape.at(wpos))+add))
-			return
-		}
-	}
-	at := start + 3 + 2*nw
-	m.shiftTable(at, 2)
-	m.tape.writeAt(at, ch)
-	m.tape.writeAt(at+1, rune(add))
-	m.tape.writeAt(start+2, rune(nw+1))
-}
-
-// shiftTable moves the table cells at and after from, n cells to the right.
-func (m *Machine) shiftTable(from, n int) {
-	end := tableData
-	contexts := int(m.tape.at(tableCount))
-	for i := 0; i < contexts; i++ {
-		end += 3 + 2*int(m.tape.at(end+2))
-	}
-	for i := end - 1; i >= from; i-- {
-		m.tape.writeAt(i+n, m.tape.at(i))
-	}
-}
-
-func fixWeight(p float64) rune {
-	if p <= 0 {
-		return 0
-	}
-	return rune(math.Round(p * float64(weightScale)))
-}
-
-func mulDiv(w, num, den int64) int64 {
-	if w <= 0 || num <= 0 {
-		return 0
-	}
-	return (w*num + den/2) / den
+	ctx := contextOf(g.token[id])
+	net.learn(ctx[0], ctx[1], &target)
 }
 
 // logP is the log of a model probability, floored so a zero stays finite.

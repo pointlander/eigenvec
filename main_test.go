@@ -165,102 +165,65 @@ func TestPrepareStripsIndentAndLineNumbers(t *testing.T) {
 	}
 }
 
-func TestPromptSumsNextCharacterMass(t *testing.T) {
-	// "abcdXY" is followed by 'q' twice and 'z' once. Both "abcdXY" and
-	// "wxyzXY" end in the order-2 context "XY", so they share a conditional
-	// distribution. "bcdXYq" ends in "Yq" and must not mix into it.
-	src := []rune("abcdXYqabcdXYzabcdXYqwxyzXYr")
-	g := buildGraph(src)
-	g.rankPages(damp, 1e-15)
-	g.normalizeSuccessors()
-
-	m := tiltProgram()
-	if m.tape.at(0) != opDecay || m.tape.at(1) != opAdds || m.tape.at(2) != opNorm || m.tape.at(3) != opHalt {
-		t.Fatalf("program = %d %d %d %d", m.tape.at(0), m.tape.at(1), m.tape.at(2), m.tape.at(3))
+func TestNetLearnsNextCharacter(t *testing.T) {
+	net := newNet(1)
+	var target [vocab]float64
+	target['q'] = 0.8
+	target['z'] = 0.2
+	before := net.predict(byte('X'), byte('Y'))
+	for range 30 {
+		net.learn('X', 'Y', &target)
 	}
-	node := g.id[tokenFrom([]rune("abcdXY"))]
-	m.observe(g, node)
-	if m.tape.at(0) != opDecay || m.tape.head != progLen-1 {
-		t.Fatalf("program moved: cell0=%d head=%d", m.tape.at(0), m.tape.head)
+	after := net.predict(byte('X'), byte('Y'))
+	sum := 0.0
+	for _, p := range after {
+		sum += p
 	}
-	ctx := contextOf(g.token[node])
-	dist := m.conditional(ctx)
-	if dist['q'] <= 0 || dist['z'] <= 0 {
-		t.Fatalf("dist = %v, want mass on both successors", dist)
+	if math.Abs(sum-1) > 1e-9 {
+		t.Fatalf("prediction sums to %v", sum)
 	}
-	if sumDist(dist) != 1 {
-		t.Fatalf("local distribution sums to %v", sumDist(dist))
+	if after['q'] <= after['z'] {
+		t.Fatalf("P(q)=%v P(z)=%v", after['q'], after['z'])
+	}
+	if after['q'] <= before['q'] {
+		t.Fatalf("P(q)=%v, before %v", after['q'], before['q'])
 	}
 
-	firstQ, firstZ := dist['q'], dist['z']
+	// A cached prediction must not outlive the step that changed the weights.
+	net.cache = make(map[[2]byte][vocab]float64)
+	stale := net.predict(byte('X'), byte('Y'))
+	net.learn('X', 'Y', &target)
+	if net.cache != nil {
+		t.Fatal("learn left the prediction cache in place")
+	}
+	fresh := net.predict(byte('X'), byte('Y'))
+	if fresh == stale {
+		t.Fatal("learn left the prediction unchanged")
+	}
+}
 
-	// Running the program on the same node again mixes the conditional
-	// with itself, then normalizes, so the mass stays 1 and the ratios stay put.
-	m.observe(g, node)
-	dist = m.conditional(ctx)
-	if math.Abs(sumDist(dist)-1) > 1e-12 {
-		t.Fatalf("normalized dist sums to %v", sumDist(dist))
+func TestNetTiltsLegalSuccessor(t *testing.T) {
+	// The token is flat between q and z. Training the context "XY" toward
+	// q should make that exit the heavier one.
+	var tok token
+	copy(tok[:], []rune("xxxxXY"))
+	g := &Graph{
+		token: []token{tok},
+		outs: [][]edge{{
+			{to: 0, w: 1, ch: 'q', p: 0.5},
+			{to: 0, w: 1, ch: 'z', p: 0.5},
+		}},
 	}
-	if math.Abs(dist['q']-firstQ) > 1e-5 || math.Abs(dist['z']-firstZ) > 1e-5 {
-		t.Fatalf("dist = %v, want q=%v z=%v", dist, firstQ, firstZ)
+	net := newNet(1)
+	var target [vocab]float64
+	target['q'] = 0.8
+	target['z'] = 0.2
+	for range 30 {
+		net.learn('X', 'Y', &target)
 	}
-
-	// A different node with the same two-character suffix is mixed in at
-	// weight mix, then normalized.
-	other := g.id[tokenFrom([]rune("wxyzXY"))]
-	if contextOf(g.token[other]) != ctx {
-		t.Fatal("wxyzXY should share the order-2 context of abcdXY")
-	}
-	before := make(map[rune]float64, len(dist))
-	for ch, p := range dist {
-		before[ch] = p
-	}
-	m.observe(g, other)
-	dist = m.conditional(ctx)
-	if math.Abs(sumDist(dist)-1) > 1e-12 {
-		t.Fatalf("mixed dist sums to %v", sumDist(dist))
-	}
-	added := map[rune]float64{}
-	for _, e := range g.outs[other] {
-		added[e.ch] += e.p
-	}
-	for ch, p := range before {
-		want := (1-mix)*p + mix*added[ch]
-		if math.Abs(dist[ch]-want) > 1e-4 {
-			t.Fatalf("dist[%q] = %v, want %v", ch, dist[ch], want)
-		}
-	}
-	for ch, p := range added {
-		want := (1-mix)*before[ch] + mix*p
-		if math.Abs(dist[ch]-want) > 1e-4 {
-			t.Fatalf("dist[%q] = %v, want %v", ch, dist[ch], want)
-		}
-	}
-
-	// A node with a different suffix gets its own conditional and leaves
-	// the "XY" distribution unchanged.
-	kept := make(map[rune]float64, len(dist))
-	for ch, p := range dist {
-		kept[ch] = p
-	}
-	separate := g.id[tokenFrom([]rune("bcdXYq"))]
-	m.observe(g, separate)
-	dist = m.conditional(ctx)
-	for ch, p := range kept {
-		if math.Abs(dist[ch]-p) > 1e-12 {
-			t.Fatalf("context XY changed at %q: %v, want %v", ch, dist[ch], p)
-		}
-	}
-	otherCtx := contextOf(g.token[separate])
-	if otherCtx == ctx {
-		t.Fatal("bcdXYq should not share the order-2 context of abcdXY")
-	}
-	separateDist := m.conditional(otherCtx)
-	if math.Abs(sumDist(separateDist)-1) > 1e-12 {
-		t.Fatalf("separate conditional sums to %v", sumDist(separateDist))
-	}
-	if separateDist['a'] <= 0 {
-		t.Fatalf("separate conditional = %v, want mass on 'a'", separateDist)
+	weights := g.priorWeights(g.distAt(net, 0), 0, g.outs[0])
+	if weights[0] <= weights[1] {
+		t.Fatalf("tilted weights q=%v z=%v", weights[0], weights[1])
 	}
 }
 
@@ -285,11 +248,11 @@ func TestCommonWordIsDiscounted(t *testing.T) {
 			},
 		},
 	}
-	commonW := g.priorWeights(nil, 0, g.outs[0], nil)
+	commonW := g.priorWeights(nil, 0, g.outs[0])
 	if commonW[0] >= commonW[1] {
 		t.Fatalf("closing \"the\" %v is not below continuing %v", commonW[0], commonW[1])
 	}
-	rareW := g.priorWeights(nil, 1, g.outs[1], nil)
+	rareW := g.priorWeights(nil, 1, g.outs[1])
 	if math.Abs(rareW[0]-rareW[1]) > 1e-12 {
 		t.Fatalf("rare word weights %v %v", rareW[0], rareW[1])
 	}
@@ -364,7 +327,7 @@ func TestMCTSLooksAhead(t *testing.T) {
 		token: make([]token, 3),
 	}
 	rng := rand.New(rand.NewPCG(1, 1^0x9e3779b97f4a7c15))
-	root := g.explore(nil, nil, 0, rng)
+	root := g.explore(nil, 0, rng)
 	var a, b float64
 	for _, c := range root.children {
 		switch c.edge.ch {
@@ -377,7 +340,7 @@ func TestMCTSLooksAhead(t *testing.T) {
 	if b <= a {
 		t.Fatalf("lookahead visits b=%v, local favorite a=%v", b, a)
 	}
-	again := g.explore(nil, nil, 0, rand.New(rand.NewPCG(1, 1^0x9e3779b97f4a7c15)))
+	again := g.explore(nil, 0, rand.New(rand.NewPCG(1, 1^0x9e3779b97f4a7c15)))
 	for i := range root.children {
 		if again.children[i].visits != root.children[i].visits {
 			t.Fatalf("visits differ on the same seed at %q", root.children[i].edge.ch)
@@ -390,132 +353,8 @@ func TestMCTSReturnsTheOnlyEdge(t *testing.T) {
 		outs:  [][]edge{{{to: 1, w: 1, ch: 'z', p: 1}}, nil},
 		token: make([]token, 2),
 	}
-	e := g.search(nil, nil, 0, rand.New(rand.NewPCG(3, 4)))
+	e := g.search(nil, 0, rand.New(rand.NewPCG(3, 4)))
 	if e.ch != 'z' || e.to != 1 {
 		t.Fatalf("search = %+v, want the only edge", e)
 	}
-}
-
-func TestUniversalMachineGrowsLeft(t *testing.T) {
-	// Blank tape, state A. The published table reaches a cell left of the
-	// origin within five steps and does not halt.
-	m := universal23()
-	for i := 0; i < 5; i++ {
-		if !m.step() {
-			t.Fatalf("halted at step %d", i)
-		}
-	}
-	if m.tape.head != 1 || m.state != 0 {
-		t.Fatalf("head %d state %d", m.tape.head, m.state)
-	}
-	if m.tape.at(-1) != 1 || m.tape.at(0) != 0 || m.tape.at(1) != 2 {
-		t.Fatalf("tape [-1]=%d [0]=%d [1]=%d", m.tape.at(-1), m.tape.at(0), m.tape.at(1))
-	}
-}
-
-func TestMachineAcceptsNonContextFree(t *testing.T) {
-	// One fixed table accepts a^n b^n c^n for every n and rejects the
-	// neighbours. A finite window cannot do that.
-	for n := 0; n <= 6; n++ {
-		m := abcMachine(strings.Repeat("a", n) + strings.Repeat("b", n) + strings.Repeat("c", n))
-		if !m.run(10000) {
-			t.Fatalf("n=%d rejected", n)
-		}
-	}
-	for _, s := range []string{"aabbc", "abbcc", "abbc", "aabc", "bac"} {
-		m := abcMachine(s)
-		if m.run(10000) {
-			t.Fatalf("%q accepted", s)
-		}
-		if m.step() {
-			t.Fatalf("%q was still running", s)
-		}
-	}
-}
-
-func TestUniversalMachineRescalesPrior(t *testing.T) {
-	g := &Graph{
-		outs: [][]edge{{
-			{to: 1, w: 1, ch: 'a', p: 0.5},
-			{to: 1, w: 1, ch: 'b', p: 0.5},
-		}},
-		token: make([]token, 2),
-	}
-	cpu := universal23()
-	before := &mctsNode{id: 0}
-	g.expand(before, nil, cpu)
-	if !cpu.step() {
-		t.Fatal("universal machine halted")
-	}
-	after := &mctsNode{id: 0}
-	g.expand(after, nil, cpu)
-	if before.children[0].prior == after.children[0].prior {
-		t.Fatal("a step of the machine left the prior unchanged")
-	}
-	for _, c := range after.children {
-		if c.prior <= 0 {
-			t.Fatalf("prior lost %q", c.edge.ch)
-		}
-	}
-}
-
-func TestMachineBiasStaysPositive(t *testing.T) {
-	m := universal23()
-	before := m.bias('a')
-	if before <= 0 {
-		t.Fatalf("bias %v", before)
-	}
-	if !m.step() {
-		t.Fatal("halted")
-	}
-	if m.bias('a') == before {
-		t.Fatal("a step of the machine left the bias unchanged")
-	}
-}
-
-// abcMachine recognizes a^n b^n c^n. It rewrites one a, one b, and one c
-// per pass, then checks that nothing else remains.
-func abcMachine(s string) *Machine {
-	m := newMachine()
-	m.accept = 6
-	for _, r := range []rune(s) {
-		m.tape.write(r)
-		m.tape.move(1)
-	}
-	m.tape.head = 0
-	// scan
-	m.set(0, 'X', 'X', +1, 0)
-	m.set(0, 'a', 'X', +1, 1)
-	m.set(0, 'Y', 'Y', 0, 4)
-	m.set(0, blank, blank, 0, 6)
-	// seek b
-	m.set(1, 'a', 'a', +1, 1)
-	m.set(1, 'Y', 'Y', +1, 1)
-	m.set(1, 'b', 'Y', +1, 2)
-	// seek c
-	m.set(2, 'b', 'b', +1, 2)
-	m.set(2, 'Z', 'Z', +1, 2)
-	m.set(2, 'c', 'Z', -1, 3)
-	// rewind to the blank before the word, then step back onto it
-	for _, r := range []rune{'a', 'b', 'c', 'X', 'Y', 'Z'} {
-		m.set(3, r, r, -1, 3)
-	}
-	m.set(3, blank, blank, +1, 0)
-	// the a's are gone: the rest must be Y's then Z's
-	m.set(4, 'Y', 'Y', +1, 4)
-	m.set(4, 'Z', 'Z', 0, 5)
-	m.set(5, 'Z', 'Z', +1, 5)
-	m.set(5, blank, blank, 0, 6)
-	return m
-}
-
-func sumDist(dist map[rune]float64) float64 {
-	sum := 0.0
-	for _, p := range dist {
-		sum += p
-	}
-	if math.Abs(sum-1) <= 1e-12 {
-		return 1
-	}
-	return sum
 }
