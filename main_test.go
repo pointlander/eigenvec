@@ -166,15 +166,15 @@ func TestPrepareStripsIndentAndLineNumbers(t *testing.T) {
 }
 
 func TestNetLearnsNextCharacter(t *testing.T) {
-	net := newNet(1)
-	var target [vocab]float64
-	target['q'] = 0.8
-	target['z'] = 0.2
-	before := net.predict(byte('X'), byte('Y'))
+	net := newNet(1, []rune{'X', 'Y', 'q', 'z'})
+	target := make([]float64, len(net.vocab))
+	target[net.id['q']] = 0.8
+	target[net.id['z']] = 0.2
+	before := net.predict('X', 'Y')
 	for range 30 {
-		net.learn('X', 'Y', &target)
+		net.learn('X', 'Y', target)
 	}
-	after := net.predict(byte('X'), byte('Y'))
+	after := net.predict('X', 'Y')
 	sum := 0.0
 	for _, p := range after {
 		sum += p
@@ -182,23 +182,55 @@ func TestNetLearnsNextCharacter(t *testing.T) {
 	if math.Abs(sum-1) > 1e-9 {
 		t.Fatalf("prediction sums to %v", sum)
 	}
-	if after['q'] <= after['z'] {
-		t.Fatalf("P(q)=%v P(z)=%v", after['q'], after['z'])
+	q, z := net.id['q'], net.id['z']
+	if after[q] <= after[z] {
+		t.Fatalf("P(q)=%v P(z)=%v", after[q], after[z])
 	}
-	if after['q'] <= before['q'] {
-		t.Fatalf("P(q)=%v, before %v", after['q'], before['q'])
+	if after[q] <= before[q] {
+		t.Fatalf("P(q)=%v, before %v", after[q], before[q])
 	}
 
 	// A cached prediction must not outlive the step that changed the weights.
-	net.cache = make(map[[2]byte][vocab]float64)
-	stale := net.predict(byte('X'), byte('Y'))
-	net.learn('X', 'Y', &target)
+	net.cache = make(map[[2]rune][]float64)
+	stale := append([]float64(nil), net.predict('X', 'Y')...)
+	net.learn('X', 'Y', target)
 	if net.cache != nil {
 		t.Fatal("learn left the prediction cache in place")
 	}
-	fresh := net.predict(byte('X'), byte('Y'))
-	if fresh == stale {
+	fresh := net.predict('X', 'Y')
+	same := len(fresh) == len(stale)
+	for i := range fresh {
+		if !same || fresh[i] != stale[i] {
+			same = false
+			break
+		}
+	}
+	if same {
 		t.Fatal("learn left the prediction unchanged")
+	}
+}
+
+func TestNetKeepsRunesDistinct(t *testing.T) {
+	// U+2019 is the curly apostrophe in the Shakespeare text. Its low 8 bits
+	// are a different character and must not share this rune's weights.
+	quote := '’'
+	low := rune(quote & 0xFF)
+	net := newNet(1, []rune{'Y', quote, low})
+	if net.id[quote] == net.id[low] {
+		t.Fatal("quote shares an output with its low byte")
+	}
+	target := make([]float64, len(net.vocab))
+	target[net.id[quote]] = 1
+	for range 30 {
+		net.learn(quote, 'Y', target)
+	}
+	got := net.predict(quote, 'Y')
+	other := net.predict(low, 'Y')
+	if got[net.id[quote]] <= got[net.id[low]] {
+		t.Fatalf("P(quote)=%v P(low)=%v", got[net.id[quote]], got[net.id[low]])
+	}
+	if got[net.id[quote]] <= other[net.id[quote]] {
+		t.Fatalf("quote context %v is not above the low-byte context %v", got[net.id[quote]], other[net.id[quote]])
 	}
 }
 
@@ -214,12 +246,12 @@ func TestNetTiltsLegalSuccessor(t *testing.T) {
 			{to: 0, w: 1, ch: 'z', p: 0.5},
 		}},
 	}
-	net := newNet(1)
-	var target [vocab]float64
-	target['q'] = 0.8
-	target['z'] = 0.2
+	net := newNet(1, []rune{'X', 'Y', 'q', 'z'})
+	target := make([]float64, len(net.vocab))
+	target[net.id['q']] = 0.8
+	target[net.id['z']] = 0.2
 	for range 30 {
-		net.learn('X', 'Y', &target)
+		net.learn('X', 'Y', target)
 	}
 	weights := g.priorWeights(g.distAt(net, 0), 0, g.outs[0])
 	if weights[0] <= weights[1] {

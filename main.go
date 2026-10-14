@@ -9,10 +9,10 @@
 // A prompt is walked as a path of overlapping 6-character nodes. At every
 // node the count-weighted PageRank of the successors is normalized into a
 // distribution over the next character. An order-2 network embeds the last
-// two characters into 256 inputs and predicts the next character with 256
-// outputs. One gradient step per committed visit trains it on that node's
-// successor distribution. Each new character is chosen by Monte Carlo tree
-// search. The tempered token distribution is tilted by the network.
+// two runes into 256 inputs and predicts the next rune, with one output for
+// each rune that occurs. One gradient step per committed visit trains it on
+// that node's successor distribution. Each new character is chosen by Monte
+// Carlo tree search. The tempered token distribution is tilted by the network.
 // Closing a frequent word such as "the" is discounted by how often the
 // corpus uses it. A rollout scores a path by the geometric mean of those
 // probabilities, and the character is drawn from the visit counts. A
@@ -50,8 +50,9 @@ const (
 	sumOrder = 2
 	// learnRate is the step size of one realtime update of the network.
 	learnRate = 0.1
-	// vocab is the number of inputs and outputs. Predictions are over bytes.
-	vocab = 256
+	// inputs is the width of the order-2 network. Each of the last two runes
+	// is embedded into this many values, and each rune has one output.
+	inputs = 256
 	// tilt is the share of a draw taken from the order-2 network.
 	// The rest follows the current token.
 	tilt = 0.15
@@ -530,7 +531,7 @@ func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 	if len(prompt) < order {
 		log.Fatalf("prompt must contain at least %d characters", order)
 	}
-	net := newNet(seed)
+	net := newNet(seed, g.alphabet())
 	cur := -1
 	for i := 0; i+order <= len(prompt); i++ {
 		node, ok := g.id[tokenFrom(prompt[i:i+order])]
@@ -683,7 +684,7 @@ type mctsNode struct {
 // Predictions made during the search are cached. The network is only read.
 func (g *Graph) search(net *Net, cur int, rng *rand.Rand) edge {
 	if net != nil {
-		net.cache = make(map[[2]byte][vocab]float64)
+		net.cache = make(map[[2]rune][]float64)
 	}
 	root := g.explore(net, cur, rng)
 	return root.draw(rng)
@@ -783,11 +784,13 @@ func (g *Graph) distAt(net *Net, id int) map[rune]float64 {
 		return nil
 	}
 	ctx := contextOf(g.token[id])
-	sm := net.predict(byteOf(ctx[0]), byteOf(ctx[1]))
+	sm := net.predict(ctx[0], ctx[1])
 	outs := g.outs[id]
 	dist := make(map[rune]float64, len(outs))
 	for _, e := range outs {
-		dist[e.ch] = sm[byteOf(e.ch)]
+		if i, ok := net.id[e.ch]; ok {
+			dist[e.ch] = sm[i]
+		}
 	}
 	return dist
 }
@@ -846,25 +849,66 @@ func meanFrom(v []float64, i int) float64 {
 	return sum / float64(len(v)-i)
 }
 
-// Net predicts the next byte from the last two bytes.
-// e0 and e1 embed the older and the newer character into 256 inputs.
-// w maps those inputs to 256 logits.
+// Net predicts the next rune from the last two runes.
+// e0 and e1 embed the older and the newer character into inputs values.
+// w maps those inputs to one logit per rune in vocab.
 type Net struct {
-	e0, e1 [vocab][vocab]float64
-	w      [vocab][vocab]float64
-	b      [vocab]float64
+	id     map[rune]int
+	vocab  []rune
+	e0, e1 [][]float64
+	w      [][]float64
+	b      []float64
 	// cache holds predictions while the weights stay fixed.
-	cache map[[2]byte][vocab]float64
+	cache map[[2]rune][]float64
+}
+
+// alphabet is the sorted set of runes this graph can read or emit.
+func (g *Graph) alphabet() []rune {
+	seen := make(map[rune]struct{})
+	add := func(r rune) {
+		seen[r] = struct{}{}
+	}
+	for i := range g.token {
+		for _, r := range g.token[i] {
+			add(r)
+		}
+	}
+	for _, outs := range g.outs {
+		for _, e := range outs {
+			add(e.ch)
+		}
+	}
+	out := make([]rune, 0, len(seen))
+	for r := range seen {
+		out = append(out, r)
+	}
+	slices.Sort(out)
+	return out
 }
 
 // newNet draws a small deterministic initialization from seed.
+// vocab is the runes the network can read and predict. Duplicates are dropped.
 // Zero weights would leave the gradient at zero.
-func newNet(seed uint64) *Net {
-	n := &Net{}
+func newNet(seed uint64, runes []rune) *Net {
+	vocab := uniqueRunes(runes)
+	n := &Net{
+		id:    make(map[rune]int, len(vocab)),
+		vocab: vocab,
+		e0:    make([][]float64, len(vocab)),
+		e1:    make([][]float64, len(vocab)),
+		w:     make([][]float64, len(vocab)),
+		b:     make([]float64, len(vocab)),
+	}
+	for i, r := range vocab {
+		n.id[r] = i
+	}
 	rng := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
-	scale := 1 / math.Sqrt(float64(vocab))
-	for i := range n.e0 {
-		for j := range n.e0[i] {
+	scale := 1 / math.Sqrt(float64(inputs))
+	for i := range vocab {
+		n.e0[i] = make([]float64, inputs)
+		n.e1[i] = make([]float64, inputs)
+		n.w[i] = make([]float64, inputs)
+		for j := range inputs {
 			n.e0[i][j] = (rng.Float64()*2 - 1) * scale
 			n.e1[i][j] = (rng.Float64()*2 - 1) * scale
 			n.w[i][j] = (rng.Float64()*2 - 1) * scale
@@ -873,28 +917,55 @@ func newNet(seed uint64) *Net {
 	return n
 }
 
-// byteOf is the low 8 bits of a character. A rune above 255 shares its
-// prediction with that byte.
-func byteOf(r rune) byte { return byte(r) }
+func uniqueRunes(runes []rune) []rune {
+	seen := make(map[rune]struct{}, len(runes))
+	out := make([]rune, 0, len(runes))
+	for _, r := range runes {
+		if _, ok := seen[r]; ok {
+			continue
+		}
+		seen[r] = struct{}{}
+		out = append(out, r)
+	}
+	slices.Sort(out)
+	return out
+}
 
-// hidden is tanh of the summed embeddings, the 256 inputs for this context.
-func (n *Net) hidden(c0, c1 byte) [vocab]float64 {
-	var h [vocab]float64
-	e0 := &n.e0[c0]
-	e1 := &n.e1[c1]
+// addEmbed adds the embedding of r into h. A rune outside vocab adds nothing.
+func addEmbed(table [][]float64, id map[rune]int, r rune, h []float64) {
+	i, ok := id[r]
+	if !ok {
+		return
+	}
+	row := table[i]
+	for j := range h {
+		h[j] += row[j]
+	}
+}
+
+// hidden is tanh of the summed embeddings, the inputs for this context.
+func (n *Net) hidden(c0, c1 rune) []float64 {
+	h := make([]float64, inputs)
+	addEmbed(n.e0, n.id, c0, h)
+	addEmbed(n.e1, n.id, c1, h)
 	for i := range h {
-		h[i] = math.Tanh(e0[i] + e1[i])
+		h[i] = math.Tanh(h[i])
 	}
 	return h
 }
 
-// probs is the softmax of the 256 logits for this hidden state.
-func (n *Net) probs(h *[vocab]float64) [vocab]float64 {
-	var logit [vocab]float64
+// probs is the softmax over the rune logits for this hidden state.
+func (n *Net) probs(h []float64) []float64 {
+	nv := len(n.vocab)
+	p := make([]float64, nv)
+	if nv == 0 {
+		return p
+	}
 	maxL := math.Inf(-1)
+	logit := make([]float64, nv)
 	for o := range logit {
 		s := n.b[o]
-		row := &n.w[o]
+		row := n.w[o]
 		for i := range row {
 			s += row[i] * h[i]
 		}
@@ -903,7 +974,6 @@ func (n *Net) probs(h *[vocab]float64) [vocab]float64 {
 			maxL = s
 		}
 	}
-	var p [vocab]float64
 	sum := 0.0
 	for o := range p {
 		p[o] = math.Exp(logit[o] - maxL)
@@ -916,17 +986,16 @@ func (n *Net) probs(h *[vocab]float64) [vocab]float64 {
 	return p
 }
 
-// predict is the distribution over the next byte. A cache hit is returned
-// while the weights are frozen.
-func (n *Net) predict(c0, c1 byte) [vocab]float64 {
-	key := [2]byte{c0, c1}
+// predict is the distribution over the next rune, indexed like vocab.
+// A cache hit is returned while the weights are frozen.
+func (n *Net) predict(c0, c1 rune) []float64 {
+	key := [2]rune{c0, c1}
 	if n.cache != nil {
 		if p, ok := n.cache[key]; ok {
 			return p
 		}
 	}
-	h := n.hidden(c0, c1)
-	p := n.probs(&h)
+	p := n.probs(n.hidden(c0, c1))
 	if n.cache != nil {
 		n.cache[key] = p
 	}
@@ -934,24 +1003,30 @@ func (n *Net) predict(c0, c1 byte) [vocab]float64 {
 }
 
 // learn takes one cross-entropy step so this context moves toward target.
-// target is a distribution over bytes. The prediction cache is dropped.
-func (n *Net) learn(c0, c1 rune, target *[vocab]float64) {
+// target is a distribution over vocab. The prediction cache is dropped.
+func (n *Net) learn(c0, c1 rune, target []float64) {
 	n.cache = nil
-	a, b := byteOf(c0), byteOf(c1)
-	h := n.hidden(a, b)
-	p := n.probs(&h)
-	var dlogit [vocab]float64
+	if len(n.vocab) == 0 {
+		return
+	}
+	h := n.hidden(c0, c1)
+	p := n.probs(h)
+	dlogit := make([]float64, len(n.vocab))
 	for o := range dlogit {
-		dlogit[o] = p[o] - target[o]
+		t := 0.0
+		if o < len(target) {
+			t = target[o]
+		}
+		dlogit[o] = p[o] - t
 	}
 	// dh uses the weights from before they change.
-	var dh [vocab]float64
+	dh := make([]float64, inputs)
 	for o := range dlogit {
 		d := dlogit[o]
 		if d == 0 {
 			continue
 		}
-		row := &n.w[o]
+		row := n.w[o]
 		for i := range dh {
 			dh[i] += d * row[i]
 		}
@@ -965,25 +1040,29 @@ func (n *Net) learn(c0, c1 rune, target *[vocab]float64) {
 			continue
 		}
 		n.b[o] -= learnRate * d
-		row := &n.w[o]
+		row := n.w[o]
 		step := learnRate * d
 		for i := range row {
 			row[i] -= step * h[i]
 		}
 	}
-	e0 := &n.e0[a]
-	e1 := &n.e1[b]
-	for i := range dh {
-		step := learnRate * dh[i]
-		e0[i] -= step
-		e1[i] -= step
+	stepEmbed := func(table [][]float64, r rune) {
+		i, ok := n.id[r]
+		if !ok {
+			return
+		}
+		row := table[i]
+		for j := range dh {
+			row[j] -= learnRate * dh[j]
+		}
 	}
+	stepEmbed(n.e0, c0)
+	stepEmbed(n.e1, c1)
 }
 
-// byteTarget is this node's successor distribution, summed on the byte
-// each character truncates to.
-func (g *Graph) byteTarget(id int) [vocab]float64 {
-	var t [vocab]float64
+// runeTarget is this node's successor distribution over the network's runes.
+func (g *Graph) runeTarget(net *Net, id int) []float64 {
+	t := make([]float64, len(net.vocab))
 	if id < 0 || id >= len(g.outs) {
 		return t
 	}
@@ -992,7 +1071,11 @@ func (g *Graph) byteTarget(id int) [vocab]float64 {
 		if e.p <= 0 {
 			continue
 		}
-		t[byteOf(e.ch)] += e.p
+		i, ok := net.id[e.ch]
+		if !ok {
+			continue
+		}
+		t[i] += e.p
 		sum += e.p
 	}
 	if sum == 0 || math.Abs(sum-1) <= 1e-12 {
@@ -1011,7 +1094,7 @@ func (g *Graph) learnNode(net *Net, id int) {
 	if net == nil || id < 0 || id >= len(g.token) || id >= len(g.outs) {
 		return
 	}
-	target := g.byteTarget(id)
+	target := g.runeTarget(net, id)
 	sum := 0.0
 	for _, p := range target {
 		sum += p
@@ -1020,7 +1103,7 @@ func (g *Graph) learnNode(net *Net, id int) {
 		return
 	}
 	ctx := contextOf(g.token[id])
-	net.learn(ctx[0], ctx[1], &target)
+	net.learn(ctx[0], ctx[1], target)
 }
 
 // logP is the log of a model probability, floored so a zero stays finite.
