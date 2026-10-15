@@ -165,98 +165,79 @@ func TestPrepareStripsIndentAndLineNumbers(t *testing.T) {
 	}
 }
 
-func TestNetLearnsNextCharacter(t *testing.T) {
-	net := newNet(1, []rune{'X', 'Y', 'q', 'z'})
-	target := make([]float64, len(net.vocab))
-	target[net.id['q']] = 0.8
-	target[net.id['z']] = 0.2
-	before := net.predict('X', 'Y')
-	for range 30 {
-		net.learn('X', 'Y', target)
+func TestRNNLearnsTheText(t *testing.T) {
+	unit := []rune("abcabc")
+	var src []rune
+	for range 80 {
+		src = append(src, unit...)
 	}
-	after := net.predict('X', 'Y')
+	g := buildGraph(src)
+	g.rankPages(damp, 1e-15)
+	g.normalizeSuccessors()
+	net := newRNN(1, g.alphabet())
+	g.prepareEmbed(net.id)
+	before := rnnProb(g, net, unit, 'a')
+	g.pretrain(net)
+	after := rnnProb(g, net, unit, 'a')
+	if after <= before {
+		t.Fatalf("P(a)=%v, before %v", after, before)
+	}
 	sum := 0.0
-	for _, p := range after {
-		sum += p
+	net.reset()
+	p := net.predict(nil)
+	for _, v := range p {
+		sum += v
 	}
 	if math.Abs(sum-1) > 1e-9 {
 		t.Fatalf("prediction sums to %v", sum)
 	}
-	q, z := net.id['q'], net.id['z']
-	if after[q] <= after[z] {
-		t.Fatalf("P(q)=%v P(z)=%v", after[q], after[z])
-	}
-	if after[q] <= before[q] {
-		t.Fatalf("P(q)=%v, before %v", after[q], before[q])
-	}
-
-	// A cached prediction must not outlive the step that changed the weights.
-	net.cache = make(map[[2]rune][]float64)
-	stale := append([]float64(nil), net.predict('X', 'Y')...)
-	net.learn('X', 'Y', target)
-	if net.cache != nil {
-		t.Fatal("learn left the prediction cache in place")
-	}
-	fresh := net.predict('X', 'Y')
-	same := len(fresh) == len(stale)
-	for i := range fresh {
-		if !same || fresh[i] != stale[i] {
-			same = false
-			break
-		}
-	}
-	if same {
-		t.Fatal("learn left the prediction unchanged")
-	}
 }
 
-func TestNetKeepsRunesDistinct(t *testing.T) {
+func TestRNNKeepsRunesDistinct(t *testing.T) {
 	// U+2019 is the curly apostrophe in the Shakespeare text. Its low 8 bits
 	// are a different character and must not share this rune's weights.
 	quote := '’'
 	low := rune(quote & 0xFF)
-	net := newNet(1, []rune{'Y', quote, low})
+	var src []rune
+	for range 40 {
+		src = append(src, []rune("abcdX")...)
+		src = append(src, quote, 'q')
+		src = append(src, []rune("abcdX")...)
+		src = append(src, low, 'z')
+	}
+	g := buildGraph(src)
+	g.rankPages(damp, 1e-15)
+	g.normalizeSuccessors()
+	net := newRNN(1, g.alphabet())
 	if net.id[quote] == net.id[low] {
 		t.Fatal("quote shares an output with its low byte")
 	}
-	target := make([]float64, len(net.vocab))
-	target[net.id[quote]] = 1
-	for range 30 {
-		net.learn(quote, 'Y', target)
+	g.prepareEmbed(net.id)
+	g.pretrain(net)
+	quoteWin := append([]rune("abcdX"), quote)
+	lowWin := append([]rune("abcdX"), low)
+	if rnnProb(g, net, quoteWin, 'q') <= rnnProb(g, net, quoteWin, 'z') {
+		t.Fatal("the quote context did not learn to predict q")
 	}
-	got := net.predict(quote, 'Y')
-	other := net.predict(low, 'Y')
-	if got[net.id[quote]] <= got[net.id[low]] {
-		t.Fatalf("P(quote)=%v P(low)=%v", got[net.id[quote]], got[net.id[low]])
-	}
-	if got[net.id[quote]] <= other[net.id[quote]] {
-		t.Fatalf("quote context %v is not above the low-byte context %v", got[net.id[quote]], other[net.id[quote]])
+	if rnnProb(g, net, lowWin, 'z') <= rnnProb(g, net, lowWin, 'q') {
+		t.Fatal("the low-byte context did not learn to predict z")
 	}
 }
 
-func TestNetTiltsLegalSuccessor(t *testing.T) {
-	// The token is flat between q and z. Training the context "XY" toward
-	// q should make that exit the heavier one.
-	var tok token
-	copy(tok[:], []rune("xxxxXY"))
-	g := &Graph{
-		token: []token{tok},
-		outs: [][]edge{{
-			{to: 0, w: 1, ch: 'q', p: 0.5},
-			{to: 0, w: 1, ch: 'z', p: 0.5},
-		}},
+// rnnProb is the network's probability of next after reading window from a
+// cleared state.
+func rnnProb(g *Graph, net *RNN, window []rune, next rune) float64 {
+	net.reset()
+	var h []float64
+	buf := make([]float64, net.in)
+	for i := 0; i+order <= len(window); i++ {
+		id, ok := g.id[tokenFrom(window[i:i+order])]
+		if !ok {
+			continue
+		}
+		h = g.stepRNN(net, h, id, buf)
 	}
-	net := newNet(1, []rune{'X', 'Y', 'q', 'z'})
-	target := make([]float64, len(net.vocab))
-	target[net.id['q']] = 0.8
-	target[net.id['z']] = 0.2
-	for range 30 {
-		net.learn('X', 'Y', target)
-	}
-	weights := g.priorWeights(g.distAt(net, 0), 0, g.outs[0])
-	if weights[0] <= weights[1] {
-		t.Fatalf("tilted weights q=%v z=%v", weights[0], weights[1])
-	}
+	return net.predict(h)[net.id[next]]
 }
 
 func TestCommonWordIsDiscounted(t *testing.T) {
@@ -359,7 +340,7 @@ func TestMCTSLooksAhead(t *testing.T) {
 		token: make([]token, 3),
 	}
 	rng := rand.New(rand.NewPCG(1, 1^0x9e3779b97f4a7c15))
-	root := g.explore(nil, 0, rng)
+	root := g.explore(nil, nil, 0, rng)
 	var a, b float64
 	for _, c := range root.children {
 		switch c.edge.ch {
@@ -372,7 +353,7 @@ func TestMCTSLooksAhead(t *testing.T) {
 	if b <= a {
 		t.Fatalf("lookahead visits b=%v, local favorite a=%v", b, a)
 	}
-	again := g.explore(nil, 0, rand.New(rand.NewPCG(1, 1^0x9e3779b97f4a7c15)))
+	again := g.explore(nil, nil, 0, rand.New(rand.NewPCG(1, 1^0x9e3779b97f4a7c15)))
 	for i := range root.children {
 		if again.children[i].visits != root.children[i].visits {
 			t.Fatalf("visits differ on the same seed at %q", root.children[i].edge.ch)
@@ -385,7 +366,7 @@ func TestMCTSReturnsTheOnlyEdge(t *testing.T) {
 		outs:  [][]edge{{{to: 1, w: 1, ch: 'z', p: 1}}, nil},
 		token: make([]token, 2),
 	}
-	e := g.search(nil, 0, rand.New(rand.NewPCG(3, 4)))
+	e := g.search(nil, nil, 0, rand.New(rand.NewPCG(3, 4)))
 	if e.ch != 'z' || e.to != 1 {
 		t.Fatalf("search = %+v, want the only edge", e)
 	}
