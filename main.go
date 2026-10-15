@@ -8,12 +8,12 @@
 //
 // A prompt is walked as a path of overlapping 6-character nodes. At every
 // node the count-weighted PageRank of the successors is normalized into a
-// distribution over the next character. A recurrent network is pretrained
-// on the text, one token at a time. Each token is its PageRank embedding:
-// the node's rank on the characters it contains, and the PageRank it sends
-// to each successor. The network predicts the next rune. Each new character
-// is chosen by Monte Carlo tree search. The tempered token distribution is
-// tilted by that prediction.
+// distribution over the next character. A transformer is pretrained on the
+// text, one token at a time. Each token is its PageRank embedding: the
+// node's rank on the characters it contains, and the PageRank it sends to
+// each successor. Attention reads the last thousand of those vectors and
+// predicts the next rune. Each new character is chosen by Monte Carlo tree
+// search. The tempered token distribution is tilted by that prediction.
 // Closing a frequent word such as "the" is discounted by how often the
 // corpus uses it. A rollout scores a path by the geometric mean of those
 // probabilities, and the character is drawn from the visit counts. A
@@ -50,11 +50,15 @@ const (
 	order = 6
 	// learnRate is the step size of one pretraining update.
 	learnRate = 0.05
-	// rnnHidden is the width of the recurrent state.
-	rnnHidden = 32
-	// clipNorm bounds the recurrent gradient on each step.
+	// dModel is the width of a token vector inside the transformer.
+	dModel = 32
+	// ffnDim is the inner width of the position-wise feed-forward layer.
+	ffnDim = 128
+	// ctxLen is how many token vectors attention can see.
+	ctxLen = 1000
+	// clipNorm bounds the output gradient on each step.
 	clipNorm = 1
-	// tilt is the share of a draw taken from the recurrent network.
+	// tilt is the share of a draw taken from the transformer.
 	// The rest follows the current token.
 	tilt = 0.15
 	// temp softens the token distribution. 1 leaves it unchanged.
@@ -519,27 +523,26 @@ func (g *Graph) normalizeSuccessors() {
 	}
 }
 
-// generate pretrains the recurrent network on the text, then replays the
-// prompt through it. Each character is chosen by Monte Carlo tree search.
-// The tempered token distribution is tilted by the network. The walk then
-// steps the network into that successor. A rollout only reads the network.
+// generate pretrains the transformer on the text, then replays the prompt
+// through it. Each character is chosen by Monte Carlo tree search. The
+// tempered token distribution is tilted by the network. The walk then
+// appends that successor to the context. A rollout only reads the network.
 func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 	if len(prompt) < order {
 		log.Fatalf("prompt must contain at least %d characters", order)
 	}
-	net := newRNN(seed, g.alphabet())
+	net := newTransformer(seed, g.alphabet())
 	g.prepareEmbed(net.id)
 	g.pretrain(net)
 	net.reset()
-	x := make([]float64, net.in)
 	cur := -1
-	var h []float64
+	var ctx []int
 	for i := 0; i+order <= len(prompt); i++ {
 		node, ok := g.id[tokenFrom(prompt[i:i+order])]
 		if !ok {
 			continue
 		}
-		h = g.stepRNN(net, h, node, x)
+		ctx = remember(ctx, node)
 		cur = node
 	}
 	if cur < 0 {
@@ -552,10 +555,10 @@ func (g *Graph) generate(prompt []rune, n int, seed uint64) []rune {
 		if len(g.outs[cur]) == 0 {
 			break
 		}
-		e := g.search(net, h, cur, rng)
+		e := g.search(net, ctx, cur, rng)
 		out = append(out, e.ch)
 		cur = e.to
-		h = g.stepRNN(net, h, cur, x)
+		ctx = remember(ctx, cur)
 	}
 	return out
 }
@@ -673,10 +676,10 @@ type mctsChild struct {
 }
 
 // mctsNode is a position in the search tree. id is the graph node.
-// h is the recurrent state after reading this token.
+// ctx is the attention context after reading this token, oldest first.
 type mctsNode struct {
 	id       int
-	h        []float64
+	ctx      []int
 	visits   float64
 	expanded bool
 	children []mctsChild
@@ -684,16 +687,16 @@ type mctsNode struct {
 
 // search chooses the next edge by Monte Carlo tree search and draws it
 // from the root visit counts. A node with one continuation is returned as it is.
-// h is the recurrent state at cur. The network is only read.
-func (g *Graph) search(net *RNN, h []float64, cur int, rng *rand.Rand) edge {
-	root := g.explore(net, h, cur, rng)
+// ctx is the attention context at cur. The network is only read.
+func (g *Graph) search(net *Transformer, ctx []int, cur int, rng *rand.Rand) edge {
+	root := g.explore(net, ctx, cur, rng)
 	return root.draw(rng)
 }
 
 // explore runs the simulations from cur and returns the search root.
 // The network is only read.
-func (g *Graph) explore(net *RNN, h []float64, cur int, rng *rand.Rand) *mctsNode {
-	root := &mctsNode{id: cur, h: h}
+func (g *Graph) explore(net *Transformer, ctx []int, cur int, rng *rand.Rand) *mctsNode {
+	root := &mctsNode{id: cur, ctx: ctx}
 	g.expand(root, net)
 	if len(root.children) <= 1 {
 		for i := range root.children {
@@ -709,7 +712,7 @@ func (g *Graph) explore(net *RNN, h []float64, cur int, rng *rand.Rand) *mctsNod
 
 // expand attaches one child per outgoing edge. The prior is the tilted
 // distribution at this state.
-func (g *Graph) expand(n *mctsNode, net *RNN) {
+func (g *Graph) expand(n *mctsNode, net *Transformer) {
 	if n.expanded {
 		return
 	}
@@ -718,7 +721,7 @@ func (g *Graph) expand(n *mctsNode, net *RNN) {
 	if len(outs) == 0 {
 		return
 	}
-	weights := g.priorWeights(g.distAt(net, n.h, n.id), n.id, outs)
+	weights := g.priorWeights(g.distAt(net, n.ctx, n.id), n.id, outs)
 	sum := 0.0
 	for _, w := range weights {
 		sum += w
@@ -735,22 +738,18 @@ func (g *Graph) expand(n *mctsNode, net *RNN) {
 
 // playout walks the tree by PUCT, rolls out the rest of the horizon, and
 // backs up the geometric mean of the model probabilities along each suffix.
-func (g *Graph) playout(root *mctsNode, net *RNN, rng *rand.Rand) {
+func (g *Graph) playout(root *mctsNode, net *Transformer, rng *rand.Rand) {
 	node := root
 	path := make([]*mctsChild, 0, mctsDepth)
 	seq := make([]float64, 0, mctsDepth)
-	var buf []float64
-	if net != nil {
-		buf = make([]float64, net.in)
-	}
 	for len(path) < mctsDepth && node.expanded && len(node.children) > 0 {
 		c := node.pick()
 		if c.node == nil {
-			var h []float64
+			var ctx []int
 			if net != nil {
-				h = g.stepRNN(net, node.h, c.edge.to, buf)
+				ctx = remember(node.ctx, c.edge.to)
 			}
-			c.node = &mctsNode{id: c.edge.to, h: h}
+			c.node = &mctsNode{id: c.edge.to, ctx: ctx}
 		}
 		path = append(path, c)
 		node = c.node
@@ -763,16 +762,16 @@ func (g *Graph) playout(root *mctsNode, net *RNN, rng *rand.Rand) {
 		g.expand(node, net)
 	}
 	id := node.id
-	h := node.h
+	ctx := node.ctx
 	for len(seq) < mctsDepth {
 		outs := g.outs[id]
 		if len(outs) == 0 {
 			break
 		}
-		e, p := g.sampleProb(g.distAt(net, h, id), id, outs, rng)
+		e, p := g.sampleProb(g.distAt(net, ctx, id), id, outs, rng)
 		id = e.to
 		if net != nil {
-			h = g.stepRNN(net, h, id, buf)
+			ctx = remember(ctx, id)
 		}
 		seq = append(seq, logP(p))
 	}
@@ -791,11 +790,11 @@ func (g *Graph) playout(root *mctsNode, net *RNN, rng *rand.Rand) {
 
 // distAt is the network's prediction on this node's outgoing edges.
 // A nil network leaves the token distribution untilted.
-func (g *Graph) distAt(net *RNN, h []float64, id int) map[rune]float64 {
+func (g *Graph) distAt(net *Transformer, ctx []int, id int) map[rune]float64 {
 	if net == nil || id < 0 || id >= len(g.outs) {
 		return nil
 	}
-	sm := net.predict(h)
+	sm := g.predictNet(net, ctx)
 	outs := g.outs[id]
 	dist := make(map[rune]float64, len(outs))
 	for _, e := range outs {
@@ -884,67 +883,116 @@ func (g *Graph) alphabet() []rune {
 	return out
 }
 
-// RNN is an Elman network. It reads a sequence of PageRank embeddings and
-// predicts the next rune. h is carried across the text. The gradient on
-// each step treats the previous state as constant. Its products and
-// rank-1 updates run on simd vectors.
-type RNN struct {
+// Transformer is one decoder block. It reads PageRank embeddings and
+// predicts the next rune. Attention sees the last ctxLen token vectors.
+// The gradient on each step treats keys and values already in the context
+// as constant. Products and rank-1 updates run on simd vectors.
+type Transformer struct {
 	id    map[rune]int
 	vocab []rune
 	in    int
-	h     []float64
-	hn    []float64
-	dz    []float64
-	dh    []float64
-	logit []float64
-	zeros []float64
-	wh    []float64
-	wx    []float64
-	bh    []float64
-	wy    []float64
-	by    []float64
+
+	wx             []float64
+	bx             []float64
+	wq, wk, wv, wo []float64
+	bq, bk, bv, bo []float64
+	rel            []float64
+	w1, b1         []float64
+	w2, b2         []float64
+	wy, by         []float64
+
+	ringH, ringK, ringV       []float64
+	hcur, kcur, vcur          []float64
+	q, ctxv, a, pre, u, y     []float64
+	dy, du, da, dctx          []float64
+	dq, dk, dv, dh            []float64
+	score, attn, logit, embed []float64
+	genK, genV                []float64
+	cache                     map[int]proj
 }
 
-// newRNN draws a small deterministic initialization from seed.
+// proj is the cached projection of one graph node. It depends only on the
+// embedding, so a frozen network can reuse it for every visit of that node.
+type proj struct {
+	h, k, v []float64
+}
+
+// newTransformer draws a small deterministic initialization from seed.
 // vocab is the runes the network can read and predict. Duplicates are dropped.
-// Zero weights would leave the gradient at zero.
-func newRNN(seed uint64, runes []rune) *RNN {
+// Zero weights would leave the gradient at zero. The attention and
+// feed-forward output maps start small so the residual path leads early updates.
+func newTransformer(seed uint64, runes []rune) *Transformer {
 	vocab := uniqueRunes(runes)
-	n := &RNN{
+	n := &Transformer{
 		id:    make(map[rune]int, len(vocab)),
 		vocab: vocab,
 		in:    len(vocab),
-		h:     make([]float64, rnnHidden),
-		hn:    make([]float64, rnnHidden),
-		dz:    make([]float64, rnnHidden),
-		dh:    make([]float64, rnnHidden),
-		logit: make([]float64, len(vocab)),
-		zeros: make([]float64, rnnHidden),
-		wh:    make([]float64, rnnHidden*rnnHidden),
-		wx:    make([]float64, rnnHidden*len(vocab)),
-		bh:    make([]float64, rnnHidden),
-		wy:    make([]float64, len(vocab)*rnnHidden),
+		wx:    make([]float64, dModel*len(vocab)),
+		bx:    make([]float64, dModel),
+		wq:    make([]float64, dModel*dModel),
+		wk:    make([]float64, dModel*dModel),
+		wv:    make([]float64, dModel*dModel),
+		wo:    make([]float64, dModel*dModel),
+		bq:    make([]float64, dModel),
+		bk:    make([]float64, dModel),
+		bv:    make([]float64, dModel),
+		bo:    make([]float64, dModel),
+		rel:   make([]float64, ctxLen),
+		w1:    make([]float64, ffnDim*dModel),
+		b1:    make([]float64, ffnDim),
+		w2:    make([]float64, dModel*ffnDim),
+		b2:    make([]float64, dModel),
+		wy:    make([]float64, len(vocab)*dModel),
 		by:    make([]float64, len(vocab)),
+		ringH: make([]float64, 0, ctxLen*dModel),
+		ringK: make([]float64, 0, ctxLen*dModel),
+		ringV: make([]float64, 0, ctxLen*dModel),
+		hcur:  make([]float64, dModel),
+		kcur:  make([]float64, dModel),
+		vcur:  make([]float64, dModel),
+		q:     make([]float64, dModel),
+		ctxv:  make([]float64, dModel),
+		a:     make([]float64, dModel),
+		pre:   make([]float64, ffnDim),
+		u:     make([]float64, ffnDim),
+		y:     make([]float64, dModel),
+		dy:    make([]float64, dModel),
+		du:    make([]float64, ffnDim),
+		da:    make([]float64, dModel),
+		dctx:  make([]float64, dModel),
+		dq:    make([]float64, dModel),
+		dk:    make([]float64, dModel),
+		dv:    make([]float64, dModel),
+		dh:    make([]float64, dModel),
+		logit: make([]float64, len(vocab)),
+		embed: make([]float64, len(vocab)),
+		cache: make(map[int]proj),
 	}
 	for i, r := range vocab {
 		n.id[r] = i
 	}
 	rng := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
-	hs := 1 / math.Sqrt(float64(rnnHidden))
-	xs := hs
-	if n.in > 0 {
-		xs = 1 / math.Sqrt(float64(n.in))
+	fanIn := n.in
+	if fanIn < 1 {
+		fanIn = 1
 	}
-	for i := range n.wh {
-		n.wh[i] = (rng.Float64()*2 - 1) * hs
-	}
-	for i := range n.wx {
-		n.wx[i] = (rng.Float64()*2 - 1) * xs
-	}
-	for i := range n.wy {
-		n.wy[i] = (rng.Float64()*2 - 1) * hs
-	}
+	fillUnit(rng, n.wx, fanIn, 1)
+	fillUnit(rng, n.wq, dModel, 1)
+	fillUnit(rng, n.wk, dModel, 1)
+	fillUnit(rng, n.wv, dModel, 1)
+	fillUnit(rng, n.wo, dModel, 0.1)
+	fillUnit(rng, n.w1, dModel, 1)
+	fillUnit(rng, n.w2, ffnDim, 0.1)
+	fillUnit(rng, n.wy, dModel, 1)
 	return n
+}
+
+// fillUnit fills w with uniform values of width gain/sqrt(fanIn).
+func fillUnit(rng *rand.Rand, w []float64, fanIn int, gain float64) {
+	s := gain / math.Sqrt(float64(fanIn))
+	for i := range w {
+		w[i] = (rng.Float64()*2 - 1) * s
+	}
 }
 
 func uniqueRunes(runes []rune) []rune {
@@ -995,19 +1043,28 @@ func (g *Graph) writeEmbed(id int, dst []float64) {
 	}
 }
 
-// stepRNN advances the state by the PageRank embedding of id.
-func (g *Graph) stepRNN(net *RNN, h []float64, id int, buf []float64) []float64 {
-	g.writeEmbed(id, buf)
-	return net.step(h, buf)
+// remember appends id to the attention context and drops the oldest token
+// once the context holds ctxLen vectors. The result does not alias ctx.
+func remember(ctx []int, id int) []int {
+	if len(ctx) >= ctxLen {
+		next := make([]int, ctxLen)
+		copy(next, ctx[len(ctx)-(ctxLen-1):])
+		next[ctxLen-1] = id
+		return next
+	}
+	next := make([]int, len(ctx)+1)
+	copy(next, ctx)
+	next[len(ctx)] = id
+	return next
 }
 
-// pretrain walks the text once. The state is carried from one character to
-// the next, and each step predicts the rune that follows the token.
-func (g *Graph) pretrain(net *RNN) {
+// pretrain walks the text once. Each step appends the token vector to the
+// context and predicts the rune that follows.
+func (g *Graph) pretrain(net *Transformer) {
 	if net == nil || g.runeID == nil || len(g.src) < order+1 {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "pretraining rnn, alphabet %d\n", len(net.vocab))
+	fmt.Fprintf(os.Stderr, "pretraining transformer, alphabet %d, context %d\n", len(net.vocab), ctxLen)
 	net.reset()
 	x := make([]float64, net.in)
 	for i := 0; i+order < len(g.src); i++ {
@@ -1017,13 +1074,6 @@ func (g *Graph) pretrain(net *RNN) {
 		}
 		g.writeEmbed(id, x)
 		net.train(x, g.src[i+order])
-	}
-}
-
-// reset clears the recurrent state.
-func (n *RNN) reset() {
-	for i := range n.h {
-		n.h[i] = 0
 	}
 }
 
@@ -1157,102 +1207,262 @@ func scale(a []float64, step float64) {
 	}
 }
 
-// recurInto writes tanh(Wh h + Wx x + bh) into out.
-func (n *RNN) recurInto(h, x, out []float64) {
-	copy(out, n.bh)
-	addDots(n.wh, h, out, rnnHidden)
-	addDots(n.wx, x, out, n.in)
-	for r := range out {
-		out[r] = math.Tanh(out[r])
-	}
+// reset clears the context and the projection cache. Weights stay.
+func (n *Transformer) reset() {
+	n.ringH = n.ringH[:0]
+	n.ringK = n.ringK[:0]
+	n.ringV = n.ringV[:0]
+	n.cache = make(map[int]proj)
 }
 
-// step returns the state after reading x. h is not modified.
-func (n *RNN) step(h, x []float64) []float64 {
-	if h == nil {
-		h = n.zeros
-	}
-	out := make([]float64, rnnHidden)
-	n.recurInto(h, x, out)
-	return out
+// project writes h, k, and v for one embedding.
+func (n *Transformer) project(x, h, k, v []float64) {
+	copy(h, n.bx)
+	addDots(n.wx, x, h, n.in)
+	copy(k, n.bk)
+	addDots(n.wk, h, k, dModel)
+	copy(v, n.bv)
+	addDots(n.wv, h, v, dModel)
 }
 
-// predict is the distribution over the next rune, indexed like vocab.
-func (n *RNN) predict(h []float64) []float64 {
-	if len(n.vocab) == 0 {
-		return nil
+// appendRing stores one token vector, dropping the oldest at ctxLen.
+func appendRing(ring, row []float64) []float64 {
+	if len(ring)/dModel >= ctxLen {
+		copy(ring, ring[dModel:])
+		ring = ring[:len(ring)-dModel]
 	}
-	if h == nil {
-		h = n.zeros
-	}
-	maxL := n.writeLogits(h)
-	p := make([]float64, len(n.vocab))
-	sum := 0.0
-	for o := range p {
-		p[o] = math.Exp(n.logit[o] - maxL)
-		sum += p[o]
-	}
-	inv := 1 / sum
-	for o := range p {
-		p[o] *= inv
-	}
-	return p
+	return append(ring, row...)
 }
 
-// train takes one cross-entropy step so this state moves toward next,
-// then stores the new state.
-func (n *RNN) train(x []float64, next rune) {
-	n.recurInto(n.h, x, n.hn)
-	if idx, ok := n.id[next]; ok && len(n.vocab) > 0 {
-		n.learnStep(x, idx)
+// logits writes the next-rune scores for h attending over keys and vals.
+// keys and vals are row-major, one dModel row per context position, oldest first.
+func (n *Transformer) logits(h, keys, vals []float64) {
+	nctx := len(keys) / dModel
+	copy(n.q, n.bq)
+	addDots(n.wq, h, n.q, dModel)
+	if cap(n.score) < nctx {
+		n.score = make([]float64, nctx)
+		n.attn = make([]float64, nctx)
 	}
-	copy(n.h, n.hn)
-}
-
-// writeLogits stores Wy h + by in n.logit and returns the largest logit.
-func (n *RNN) writeLogits(h []float64) float64 {
+	n.score = n.score[:nctx]
+	n.attn = n.attn[:nctx]
+	scaleQ := 1 / math.Sqrt(float64(dModel))
+	copy(n.dq, n.q)
+	scale(n.dq, scaleQ)
+	zero(n.score)
+	addDots(keys, n.dq, n.score, dModel)
+	for i := range nctx {
+		n.score[i] += n.rel[nctx-1-i]
+	}
+	copy(n.attn, n.score)
+	softmax(n.attn)
+	for i := range n.ctxv {
+		n.ctxv[i] = 0
+	}
+	mixRows(n.ctxv, vals, n.attn, dModel)
+	copy(n.a, n.bo)
+	for i := range n.a {
+		n.a[i] += h[i]
+	}
+	addDots(n.wo, n.ctxv, n.a, dModel)
+	copy(n.pre, n.b1)
+	addDots(n.w1, n.a, n.pre, dModel)
+	for i := range n.u {
+		n.u[i] = math.Tanh(n.pre[i])
+	}
+	copy(n.y, n.b2)
+	for i := range n.y {
+		n.y[i] += n.a[i]
+	}
+	addDots(n.w2, n.u, n.y, ffnDim)
 	copy(n.logit, n.by)
-	addDots(n.wy, h, n.logit, rnnHidden)
-	maxL := math.Inf(-1)
-	for _, s := range n.logit {
+	addDots(n.wy, n.y, n.logit, dModel)
+}
+
+// train appends x to the context and takes one cross-entropy step toward next.
+func (n *Transformer) train(x []float64, next rune) {
+	if n.in == 0 || len(n.vocab) == 0 {
+		return
+	}
+	n.project(x, n.hcur, n.kcur, n.vcur)
+	n.ringH = appendRing(n.ringH, n.hcur)
+	n.ringK = appendRing(n.ringK, n.kcur)
+	n.ringV = appendRing(n.ringV, n.vcur)
+	n.logits(n.hcur, n.ringK, n.ringV)
+	if idx, ok := n.id[next]; ok {
+		n.learn(x, idx)
+	}
+}
+
+// learn applies the output gradient. Stored keys and values of earlier
+// tokens stay as they were when those tokens were read.
+func (n *Transformer) learn(x []float64, target int) {
+	nctx := len(n.ringK) / dModel
+	maxL := n.logit[0]
+	for _, s := range n.logit[1:] {
 		if s > maxL {
 			maxL = s
 		}
 	}
-	return maxL
-}
-
-// learnStep applies the output gradient and the one-step recurrent gradient.
-func (n *RNN) learnStep(x []float64, target int) {
-	maxL := n.writeLogits(n.hn)
 	sum := 0.0
-	for o := range n.logit {
-		n.logit[o] = math.Exp(n.logit[o] - maxL)
-		sum += n.logit[o]
+	for i, s := range n.logit {
+		e := math.Exp(s - maxL)
+		n.logit[i] = e
+		sum += e
 	}
 	inv := 1 / sum
-	for o := range n.logit {
-		n.logit[o] = n.logit[o] * inv
-		if o == target {
-			n.logit[o] -= 1
+	for i := range n.logit {
+		n.logit[i] *= inv
+		if i == target {
+			n.logit[i] -= 1
 		}
 	}
-	for c := range n.dh {
-		n.dh[c] = 0
+	zero(n.dy)
+	mixRows(n.dy, n.wy, n.logit, dModel)
+	clip(n.dy, clipNorm)
+
+	zero(n.du)
+	mixRows(n.du, n.w2, n.dy, ffnDim)
+	for i := range n.du {
+		n.du[i] *= 1 - n.u[i]*n.u[i]
 	}
-	mixRows(n.dh, n.wy, n.logit, rnnHidden)
-	for r := range n.dz {
-		n.dz[r] = n.dh[r] * (1 - n.hn[r]*n.hn[r])
+	copy(n.da, n.dy)
+	mixRows(n.da, n.w1, n.du, dModel)
+
+	zero(n.dctx)
+	mixRows(n.dctx, n.wo, n.da, dModel)
+
+	zero(n.score)
+	addDots(n.ringV, n.dctx, n.score, dModel)
+	var dotA float64
+	for i := range nctx {
+		dotA += n.attn[i] * n.score[i]
 	}
-	clip(n.dz, clipNorm)
-	for o, d := range n.logit {
-		n.by[o] -= learnRate * d
+	scaleQ := 1 / math.Sqrt(float64(dModel))
+	for i := range nctx {
+		n.score[i] = n.attn[i] * (n.score[i] - dotA)
+		n.rel[nctx-1-i] -= learnRate * n.score[i]
 	}
-	rank1(n.wy, n.logit, n.hn, rnnHidden, -learnRate)
-	rank1(n.wh, n.dz, n.h, rnnHidden, -learnRate)
-	rank1(n.wx, n.dz, x, n.in, -learnRate)
-	for r, d := range n.dz {
-		n.bh[r] -= learnRate * d
+	zero(n.dq)
+	mixRows(n.dq, n.ringK, n.score, dModel)
+	scale(n.dq, scaleQ)
+
+	last := nctx - 1
+	ds := n.score[last] * scaleQ
+	for i := range n.dk {
+		n.dk[i] = ds * n.q[i]
+		n.dv[i] = n.attn[last] * n.dctx[i]
+	}
+	copy(n.dh, n.da)
+	mixRows(n.dh, n.wq, n.dq, dModel)
+	mixRows(n.dh, n.wk, n.dk, dModel)
+	mixRows(n.dh, n.wv, n.dv, dModel)
+
+	for i := range n.by {
+		n.by[i] -= learnRate * n.logit[i]
+	}
+	rank1(n.wy, n.logit, n.y, dModel, -learnRate)
+	rank1(n.w2, n.dy, n.u, ffnDim, -learnRate)
+	for i := range n.b2 {
+		n.b2[i] -= learnRate * n.dy[i]
+	}
+	rank1(n.w1, n.du, n.a, dModel, -learnRate)
+	for i := range n.b1 {
+		n.b1[i] -= learnRate * n.du[i]
+	}
+	rank1(n.wo, n.da, n.ctxv, dModel, -learnRate)
+	for i := range n.bo {
+		n.bo[i] -= learnRate * n.da[i]
+	}
+	rank1(n.wq, n.dq, n.hcur, dModel, -learnRate)
+	for i := range n.bq {
+		n.bq[i] -= learnRate * n.dq[i]
+	}
+	rank1(n.wk, n.dk, n.hcur, dModel, -learnRate)
+	for i := range n.bk {
+		n.bk[i] -= learnRate * n.dk[i]
+	}
+	rank1(n.wv, n.dv, n.hcur, dModel, -learnRate)
+	for i := range n.bv {
+		n.bv[i] -= learnRate * n.dv[i]
+	}
+	rank1(n.wx, n.dh, x, n.in, -learnRate)
+	for i := range n.bx {
+		n.bx[i] -= learnRate * n.dh[i]
+	}
+}
+
+// predictNet is the distribution over the next rune after reading ctx.
+// An empty context is the softmax of the output bias.
+func (g *Graph) predictNet(n *Transformer, ctx []int) []float64 {
+	if n == nil || len(n.vocab) == 0 {
+		return nil
+	}
+	if len(ctx) == 0 {
+		p := make([]float64, len(n.by))
+		copy(p, n.by)
+		softmax(p)
+		return p
+	}
+	if n.cache == nil {
+		n.cache = make(map[int]proj)
+	}
+	n.genK = n.genK[:0]
+	n.genV = n.genV[:0]
+	var h []float64
+	for _, id := range ctx {
+		p := n.cached(g, id)
+		n.genK = append(n.genK, p.k...)
+		n.genV = append(n.genV, p.v...)
+		h = p.h
+	}
+	n.logits(h, n.genK, n.genV)
+	p := make([]float64, len(n.logit))
+	copy(p, n.logit)
+	softmax(p)
+	return p
+}
+
+// cached returns the projection of id, computing it once for this network.
+func (n *Transformer) cached(g *Graph, id int) proj {
+	if p, ok := n.cache[id]; ok {
+		return p
+	}
+	g.writeEmbed(id, n.embed)
+	h := make([]float64, dModel)
+	k := make([]float64, dModel)
+	v := make([]float64, dModel)
+	n.project(n.embed, h, k, v)
+	p := proj{h: h, k: k, v: v}
+	n.cache[id] = p
+	return p
+}
+
+func softmax(v []float64) {
+	if len(v) == 0 {
+		return
+	}
+	maxL := v[0]
+	for _, s := range v[1:] {
+		if s > maxL {
+			maxL = s
+		}
+	}
+	sum := 0.0
+	for i, s := range v {
+		e := math.Exp(s - maxL)
+		v[i] = e
+		sum += e
+	}
+	inv := 1 / sum
+	for i := range v {
+		v[i] *= inv
+	}
+}
+
+func zero(v []float64) {
+	for i := range v {
+		v[i] = 0
 	}
 }
 

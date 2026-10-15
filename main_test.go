@@ -231,7 +231,7 @@ func ones(n int) []float64 {
 	return o
 }
 
-func TestRNNLearnsTheText(t *testing.T) {
+func TestTransformerLearnsTheText(t *testing.T) {
 	unit := []rune("abcabc")
 	var src []rune
 	for range 80 {
@@ -240,17 +240,17 @@ func TestRNNLearnsTheText(t *testing.T) {
 	g := buildGraph(src)
 	g.rankPages(damp, 1e-15)
 	g.normalizeSuccessors()
-	net := newRNN(1, g.alphabet())
+	net := newTransformer(1, g.alphabet())
 	g.prepareEmbed(net.id)
-	before := rnnProb(g, net, unit, 'a')
+	before := modelProb(g, net, unit, 'a')
 	g.pretrain(net)
-	after := rnnProb(g, net, unit, 'a')
+	after := modelProb(g, net, unit, 'a')
 	if after <= before {
 		t.Fatalf("P(a)=%v, before %v", after, before)
 	}
 	sum := 0.0
 	net.reset()
-	p := net.predict(nil)
+	p := g.predictNet(net, nil)
 	for _, v := range p {
 		sum += v
 	}
@@ -259,7 +259,20 @@ func TestRNNLearnsTheText(t *testing.T) {
 	}
 }
 
-func TestRNNKeepsRunesDistinct(t *testing.T) {
+func TestContextKeepsAThousandVectors(t *testing.T) {
+	var ctx []int
+	for i := range ctxLen + 5 {
+		ctx = remember(ctx, i)
+	}
+	if len(ctx) != ctxLen {
+		t.Fatalf("context length %d", len(ctx))
+	}
+	if ctx[0] != 5 || ctx[len(ctx)-1] != ctxLen+4 {
+		t.Fatalf("context spans %d..%d", ctx[0], ctx[len(ctx)-1])
+	}
+}
+
+func TestTransformerKeepsRunesDistinct(t *testing.T) {
 	// U+2019 is the curly apostrophe in the Shakespeare text. Its low 8 bits
 	// are a different character and must not share this rune's weights.
 	quote := '’'
@@ -274,7 +287,7 @@ func TestRNNKeepsRunesDistinct(t *testing.T) {
 	g := buildGraph(src)
 	g.rankPages(damp, 1e-15)
 	g.normalizeSuccessors()
-	net := newRNN(1, g.alphabet())
+	net := newTransformer(1, g.alphabet())
 	if net.id[quote] == net.id[low] {
 		t.Fatal("quote shares an output with its low byte")
 	}
@@ -282,28 +295,27 @@ func TestRNNKeepsRunesDistinct(t *testing.T) {
 	g.pretrain(net)
 	quoteWin := append([]rune("abcdX"), quote)
 	lowWin := append([]rune("abcdX"), low)
-	if rnnProb(g, net, quoteWin, 'q') <= rnnProb(g, net, quoteWin, 'z') {
+	if modelProb(g, net, quoteWin, 'q') <= modelProb(g, net, quoteWin, 'z') {
 		t.Fatal("the quote context did not learn to predict q")
 	}
-	if rnnProb(g, net, lowWin, 'z') <= rnnProb(g, net, lowWin, 'q') {
+	if modelProb(g, net, lowWin, 'z') <= modelProb(g, net, lowWin, 'q') {
 		t.Fatal("the low-byte context did not learn to predict z")
 	}
 }
 
-// rnnProb is the network's probability of next after reading window from a
-// cleared state.
-func rnnProb(g *Graph, net *RNN, window []rune, next rune) float64 {
+// modelProb is the network's probability of next after reading window from a
+// cleared context.
+func modelProb(g *Graph, net *Transformer, window []rune, next rune) float64 {
 	net.reset()
-	var h []float64
-	buf := make([]float64, net.in)
+	var ctx []int
 	for i := 0; i+order <= len(window); i++ {
 		id, ok := g.id[tokenFrom(window[i:i+order])]
 		if !ok {
 			continue
 		}
-		h = g.stepRNN(net, h, id, buf)
+		ctx = remember(ctx, id)
 	}
-	return net.predict(h)[net.id[next]]
+	return g.predictNet(net, ctx)[net.id[next]]
 }
 
 func TestCommonWordIsDiscounted(t *testing.T) {
