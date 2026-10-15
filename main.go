@@ -32,6 +32,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"os"
+	"simd"
 	"slices"
 	"strconv"
 	"strings"
@@ -885,7 +886,8 @@ func (g *Graph) alphabet() []rune {
 
 // RNN is an Elman network. It reads a sequence of PageRank embeddings and
 // predicts the next rune. h is carried across the text. The gradient on
-// each step treats the previous state as constant.
+// each step treats the previous state as constant. Its products and
+// rank-1 updates run on simd vectors.
 type RNN struct {
 	id    map[rune]int
 	vocab []rune
@@ -1025,19 +1027,143 @@ func (n *RNN) reset() {
 	}
 }
 
+// vecLen is the number of float64 lanes in one simd vector.
+// The binary is built with GOEXPERIMENT=simd. The width stays fixed for
+// the process. It is read from a zero vector because a package-level
+// SIMD initializer is not reliable.
+func vecLen() int {
+	return (simd.Float64s{}).Len()
+}
+
+// hsum adds the lanes of v. A vector holds at most eight float64s.
+func hsum(v simd.Float64s) float64 {
+	var buf [8]float64
+	v.Store(buf[:])
+	s := 0.0
+	for i := range v.Len() {
+		s += buf[i]
+	}
+	return s
+}
+
+// addDots adds each row of w, dotted with x, into dst.
+// w is row-major, with len(dst) rows of width. A short tail is loaded
+// with zeros in the unused lanes. Lane sums are not a left fold.
+func addDots(w, x, dst []float64, width int) {
+	if width == 0 || len(dst) == 0 {
+		return
+	}
+	x = x[:width:width]
+	n := vecLen()
+	full := width - width%n
+	for r := range dst {
+		base := r * width
+		row := w[base : base+width : base+width]
+		var acc simd.Float64s
+		for i := n; i <= full; i += n {
+			acc = simd.LoadFloat64s(row[i-n:i]).MulAdd(simd.LoadFloat64s(x[i-n:i]), acc)
+		}
+		if full < width {
+			rv, _ := simd.LoadFloat64sPart(row[full:])
+			xv, _ := simd.LoadFloat64sPart(x[full:])
+			acc = rv.MulAdd(xv, acc)
+		}
+		dst[r] += hsum(acc)
+	}
+}
+
+// mixRows adds coef[r] times row r of w into dst.
+// w is row-major, with len(coef) rows of width. dst has length width.
+func mixRows(dst, w, coef []float64, width int) {
+	if width == 0 || len(coef) == 0 {
+		return
+	}
+	dst = dst[:width:width]
+	n := vecLen()
+	full := width - width%n
+	for r, step := range coef {
+		scale := simd.BroadcastFloat64s(step)
+		base := r * width
+		row := w[base : base+width : base+width]
+		for i := n; i <= full; i += n {
+			scale.MulAdd(simd.LoadFloat64s(row[i-n:i]), simd.LoadFloat64s(dst[i-n:i])).Store(dst[i-n : i])
+		}
+		if full < width {
+			rv, _ := simd.LoadFloat64sPart(row[full:])
+			dv, _ := simd.LoadFloat64sPart(dst[full:])
+			scale.MulAdd(rv, dv).StorePart(dst[full:])
+		}
+	}
+}
+
+// rank1 adds (alpha * left[r]) * right to row r of a.
+// a is row-major, with len(left) rows of width.
+func rank1(a, left, right []float64, width int, alpha float64) {
+	if width == 0 || len(left) == 0 {
+		return
+	}
+	right = right[:width:width]
+	n := vecLen()
+	full := width - width%n
+	for r, v := range left {
+		scale := simd.BroadcastFloat64s(alpha * v)
+		base := r * width
+		row := a[base : base+width : base+width]
+		for i := n; i <= full; i += n {
+			scale.MulAdd(simd.LoadFloat64s(right[i-n:i]), simd.LoadFloat64s(row[i-n:i])).Store(row[i-n : i])
+		}
+		if full < width {
+			rv, _ := simd.LoadFloat64sPart(right[full:])
+			av, _ := simd.LoadFloat64sPart(row[full:])
+			scale.MulAdd(rv, av).StorePart(row[full:])
+		}
+	}
+}
+
+// dot is the inner product of two equal-length slices.
+func dot(a, b []float64) float64 {
+	if len(a) == 0 {
+		return 0
+	}
+	var dst [1]float64
+	addDots(a, b, dst[:], len(a))
+	return dst[0]
+}
+
+// addScaled adds step*b to a. a and b have the same length.
+func addScaled(a, b []float64, step float64) {
+	if len(a) == 0 {
+		return
+	}
+	left := [1]float64{1}
+	rank1(a, left[:], b, len(a), step)
+}
+
+// scale multiplies each element of a by step.
+func scale(a []float64, step float64) {
+	if len(a) == 0 {
+		return
+	}
+	n := vecLen()
+	factor := simd.BroadcastFloat64s(step)
+	a = a[:len(a):len(a)]
+	full := len(a) - len(a)%n
+	for i := n; i <= full; i += n {
+		simd.LoadFloat64s(a[i-n : i]).Mul(factor).Store(a[i-n : i])
+	}
+	if full < len(a) {
+		av, _ := simd.LoadFloat64sPart(a[full:])
+		av.Mul(factor).StorePart(a[full:])
+	}
+}
+
 // recurInto writes tanh(Wh h + Wx x + bh) into out.
 func (n *RNN) recurInto(h, x, out []float64) {
-	for r := range rnnHidden {
-		s := n.bh[r]
-		base := r * rnnHidden
-		for c := range rnnHidden {
-			s += n.wh[base+c] * h[c]
-		}
-		base = r * n.in
-		for c := range n.in {
-			s += n.wx[base+c] * x[c]
-		}
-		out[r] = math.Tanh(s)
+	copy(out, n.bh)
+	addDots(n.wh, h, out, rnnHidden)
+	addDots(n.wx, x, out, n.in)
+	for r := range out {
+		out[r] = math.Tanh(out[r])
 	}
 }
 
@@ -1059,18 +1185,7 @@ func (n *RNN) predict(h []float64) []float64 {
 	if h == nil {
 		h = n.zeros
 	}
-	maxL := math.Inf(-1)
-	for o := range n.vocab {
-		s := n.by[o]
-		base := o * rnnHidden
-		for c := range rnnHidden {
-			s += n.wy[base+c] * h[c]
-		}
-		n.logit[o] = s
-		if s > maxL {
-			maxL = s
-		}
-	}
+	maxL := n.writeLogits(h)
 	p := make([]float64, len(n.vocab))
 	sum := 0.0
 	for o := range p {
@@ -1094,20 +1209,22 @@ func (n *RNN) train(x []float64, next rune) {
 	copy(n.h, n.hn)
 }
 
-// learnStep applies the output gradient and the one-step recurrent gradient.
-func (n *RNN) learnStep(x []float64, target int) {
+// writeLogits stores Wy h + by in n.logit and returns the largest logit.
+func (n *RNN) writeLogits(h []float64) float64 {
+	copy(n.logit, n.by)
+	addDots(n.wy, h, n.logit, rnnHidden)
 	maxL := math.Inf(-1)
-	for o := range n.logit {
-		s := n.by[o]
-		base := o * rnnHidden
-		for c := range rnnHidden {
-			s += n.wy[base+c] * n.hn[c]
-		}
-		n.logit[o] = s
+	for _, s := range n.logit {
 		if s > maxL {
 			maxL = s
 		}
 	}
+	return maxL
+}
+
+// learnStep applies the output gradient and the one-step recurrent gradient.
+func (n *RNN) learnStep(x []float64, target int) {
+	maxL := n.writeLogits(n.hn)
 	sum := 0.0
 	for o := range n.logit {
 		n.logit[o] = math.Exp(n.logit[o] - maxL)
@@ -1123,53 +1240,28 @@ func (n *RNN) learnStep(x []float64, target int) {
 	for c := range n.dh {
 		n.dh[c] = 0
 	}
-	for o := range n.logit {
-		d := n.logit[o]
-		base := o * rnnHidden
-		for c := range rnnHidden {
-			n.dh[c] += d * n.wy[base+c]
-		}
-	}
+	mixRows(n.dh, n.wy, n.logit, rnnHidden)
 	for r := range n.dz {
 		n.dz[r] = n.dh[r] * (1 - n.hn[r]*n.hn[r])
 	}
 	clip(n.dz, clipNorm)
-	for o := range n.logit {
-		d := n.logit[o]
+	for o, d := range n.logit {
 		n.by[o] -= learnRate * d
-		base := o * rnnHidden
-		step := learnRate * d
-		for c := range rnnHidden {
-			n.wy[base+c] -= step * n.hn[c]
-		}
 	}
-	for r := range n.dz {
-		d := n.dz[r]
+	rank1(n.wy, n.logit, n.hn, rnnHidden, -learnRate)
+	rank1(n.wh, n.dz, n.h, rnnHidden, -learnRate)
+	rank1(n.wx, n.dz, x, n.in, -learnRate)
+	for r, d := range n.dz {
 		n.bh[r] -= learnRate * d
-		base := r * rnnHidden
-		step := learnRate * d
-		for c := range rnnHidden {
-			n.wh[base+c] -= step * n.h[c]
-		}
-		base = r * n.in
-		for c := range n.in {
-			n.wx[base+c] -= step * x[c]
-		}
 	}
 }
 
 func clip(v []float64, limit float64) {
-	sum := 0.0
-	for _, x := range v {
-		sum += x * x
-	}
+	sum := dot(v, v)
 	if sum == 0 || sum <= limit*limit {
 		return
 	}
-	s := limit / math.Sqrt(sum)
-	for i := range v {
-		v[i] *= s
-	}
+	scale(v, limit/math.Sqrt(sum))
 }
 
 // logP is the log of a model probability, floored so a zero stays finite.

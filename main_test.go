@@ -165,6 +165,72 @@ func TestPrepareStripsIndentAndLineNumbers(t *testing.T) {
 	}
 }
 
+func TestSIMDKernelsMatchExactSums(t *testing.T) {
+	lengths := []int{0, 1, 2, 3, 7, 8, 9, 31, 32, 100}
+	for _, n := range lengths {
+		a := make([]float64, n)
+		b := make([]float64, n)
+		for i := range a {
+			a[i] = float64(i + 1)
+			b[i] = float64((i%5)+1) / 2
+		}
+		want := float64(n * (n + 1) / 2)
+		if got := dot(a, ones(n)); got != want {
+			t.Fatalf("dot len %d = %v, want %v", n, got, want)
+		}
+		sq := float64(n * (n + 1) * (2*n + 1) / 6)
+		if got := dot(a, a); got != sq {
+			t.Fatalf("sum of squares len %d = %v, want %v", n, got, sq)
+		}
+		got := append([]float64(nil), a...)
+		addScaled(got, b, -0.5)
+		for i := range a {
+			want := a[i] - 0.5*b[i]
+			if got[i] != want {
+				t.Fatalf("addScaled len %d [%d] = %v, want %v", n, i, got[i], want)
+			}
+		}
+		scaled := append([]float64(nil), a...)
+		scale(scaled, 0.5)
+		for i := range a {
+			if scaled[i] != a[i]*0.5 {
+				t.Fatalf("scale len %d [%d] = %v, want %v", n, i, scaled[i], a[i]*0.5)
+			}
+		}
+	}
+	v := []float64{3, 4, 12}
+	clip(v, 5)
+	s := 5 / 13.0
+	for i, want := range []float64{3 * s, 4 * s, 12 * s} {
+		if v[i] != want {
+			t.Fatalf("clip[%d] = %v, want %v", i, v[i], want)
+		}
+	}
+	same := []float64{0.25, -0.25}
+	clip(same, 1)
+	if same[0] != 0.25 || same[1] != -0.25 {
+		t.Fatalf("short vector was clipped to %v", same)
+	}
+	clip(nil, 1)
+
+	w := []float64{1, 2, 3, 4, 5, 6}
+	dst := []float64{0, 0, 0}
+	mixRows(dst, w, []float64{2, -1}, 3)
+	for i, want := range []float64{-2, -1, 0} {
+		if dst[i] != want {
+			t.Fatalf("mixRows[%d] = %v, want %v", i, dst[i], want)
+		}
+	}
+}
+
+func ones(n int) []float64 {
+	o := make([]float64, n)
+	for i := range o {
+		o[i] = 1
+	}
+	return o
+}
+
 func TestRNNLearnsTheText(t *testing.T) {
 	unit := []rune("abcabc")
 	var src []rune
